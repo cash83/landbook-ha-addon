@@ -1,5 +1,7 @@
 # Landbook LAN MQTT Bridge
 
+![Landbook FPPT-T2400](images/landbook-fppt-t2400.png)
+
 ## 0.3.20-switch-quarantine
 
 Fix principale: evita comandi/switch casuali dopo reconnect LAN.

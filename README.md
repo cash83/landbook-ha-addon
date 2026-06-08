@@ -2,6 +2,8 @@
 
 Home Assistant add-on repository for the Landbook FPPT-T2400 LAN MQTT Bridge.
 
+![Landbook FPPT-T2400](landbook_ha_addon/images/landbook-fppt-t2400.png)
+
 ## Add repository
 
 In Home Assistant:
