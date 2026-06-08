@@ -1,0 +1,43 @@
+name: Landbook LAN MQTT Bridge
+version: "0.3.80"
+slug: landbook_lan_mqtt_bridge
+description: "Landbook FPPT-T2400 LAN bridge. Inserisci email, password e app: la LAN key viene scoperta automaticamente."
+url: "https://github.com/cash83/landbook-ha-addon"
+arch:
+  - aarch64
+  - amd64
+  - armhf
+  - armv7
+  - i386
+startup: services
+boot: auto
+init: false
+host_network: true
+services:
+  - mqtt:need
+options:
+  wf_email: ""
+  wf_password: ""
+  app: "landbook"
+  device_key: ""
+  device_host: "192.168.1.65"
+  device_port: 6607
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+  battery_capacity_wh: 2048
+  log_level: "info"
+schema:
+  wf_email: str
+  wf_password: password
+  app: list(wonderfree|landbook|landecia|northamerica|europe|china)
+  device_key: str?
+  device_host: str
+  device_port: port
+  mqtt_host: str
+  mqtt_port: port
+  mqtt_user: str?
+  mqtt_password: password?
+  battery_capacity_wh: int
+  log_level: list(debug|info|warning|error)
