@@ -1,5 +1,5 @@
 name: Landbook LAN MQTT Bridge
-version: "0.3.81"
+version: "0.3.82"
 slug: landbook_lan_mqtt_bridge
 description: "Landbook FPPT-T2400 LAN bridge. Inserisci email, password e app: la LAN key viene scoperta automaticamente."
 url: "https://github.com/cash83/landbook-ha-addon"

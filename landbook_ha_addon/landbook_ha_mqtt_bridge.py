@@ -64,7 +64,7 @@ WIFI_FROZEN_ALERT_COOLDOWN = 300 # evita riavvii router troppo frequenti
 # ── Device identity ──────────────────────────────────────────────────────────
 DEVICE_KEY   = "000000000000"
 DEVICE_NAME  = "Landbook FPPT-T2400"
-APP_VERSION  = "0.3.80"
+APP_VERSION  = "0.3.82"
 OUTPUT_POWER_TAG = 0x00EA
 BUS_REFRESH_TAG  = 0x009A
 BUS_MASK_IDS = [

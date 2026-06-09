@@ -7,7 +7,7 @@ import sys
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
 log = logging.getLogger("addon_run")
-APP_VERSION = "0.3.80"
+APP_VERSION = "0.3.82"
 
 
 def load_options():

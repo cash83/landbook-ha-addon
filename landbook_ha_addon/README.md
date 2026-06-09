@@ -4,7 +4,7 @@ Home Assistant add-on for the Landbook FPPT-T2400 LAN MQTT bridge.
 
 ## Versione
 
-Add-on: `0.3.81`
+Add-on: `0.3.82`
 
 ## Come funziona
 
