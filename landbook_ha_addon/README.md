@@ -7,6 +7,26 @@ codici reali del TSL, senza una lista statica FPPT-T2400 nel bridge. Dopo il
 recupero iniziale, il funzionamento normale avviene in LAN tramite l'IP locale
 della power station e MQTT discovery.
 
+## Progetto non ufficiale
+
+Questo add-on e' un progetto open-source della community e non e' affiliato,
+approvato o sponsorizzato da Wonderfree, Landbook, Landecia, Pecron o dai
+rispettivi produttori. I marchi appartengono ai rispettivi proprietari.
+
+L'uso del bridge avviene sotto la propria responsabilita'. Per supporto
+ufficiale del dispositivo, firmware, app o account, fai riferimento ai canali
+ufficiali del produttore.
+
+## Account ufficiale richiesto
+
+Per usare il bridge serve avere gia':
+
+- un account attivo nell'app ufficiale del dispositivo
+- il dispositivo gia' registrato nell'app ufficiale
+
+L'add-on usa quelle credenziali solo per recuperare automaticamente LAN key e
+schema TSL. Non crea account separati e non aggira la registrazione ufficiale.
+
 La versione corrente e' quella mostrata nel pannello dell'add-on, nel campo
 `Versione attuale`.
 
