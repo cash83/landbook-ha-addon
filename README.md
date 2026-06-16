@@ -15,6 +15,15 @@ This add-on is provided as-is. Use it at your own responsibility. For official
 device support, firmware support, or account issues, use the official apps and
 vendor support channels.
 
+## 📱 Prerequisites — Official Account
+
+To use this bridge, you must **already have an active account** in your device's official app and have completed device registration through that app:
+
+| Device | Official App | Store |
+|---|---|---|
+| **Wonderfree** | Wonderfree App | [App Store](https://apps.apple.com) / [Google Play](https://play.google.com) |
+| **Landbook** | Landbook App | [App Store](https://apps.apple.com) / [Google Play](https://play.google.com) | |
+
 ## What This Add-on Does
 
 `landbook_ha_addon` is a LAN-first MQTT bridge for compatible power stations.
@@ -56,4 +65,4 @@ https://github.com/cash83/landbook-ha-addon
 
 - `landbook_ha_addon`: Landbook FPPT-T2400 LAN bridge with MQTT discovery.
 
-The add-on asks for the Landbook app email/password in its options only so it can discover the LAN key automatically. Do not publish your add-on options or logs with private credentials.
+The add-on asks for the Landbook/Wonderfree app email/password in its options only so it can discover the LAN key automatically. Do not publish your add-on options or logs with private credentials.
