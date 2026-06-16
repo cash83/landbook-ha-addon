@@ -1,5 +1,5 @@
 name: Landbook LAN MQTT Bridge
-version: "0.6.18"
+version: "0.6.19"
 slug: landbook_lan_mqtt_bridge
 description: "Landbook LAN bridge TSL-first. Inserisci email, password e app: LAN key e schema TSL vengono scoperti automaticamente."
 url: "https://github.com/cash83/landbook-ha-addon"
