@@ -1,4 +1,4 @@
-"""
+﻿"""
 Landbook FPPT-T2400 — LAN to Home Assistant MQTT bridge  v0.3.79-fixed
 
 Design: connect → subscribe(10s) → bus_mask(8s) → bus_refresh(20s) → recv loop → reconnect on silence/error
@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 from landbook_lan_probe import encode_cmd, hexs, iter_frames, recv_some
-from landbook_local_client import DEFAULT_KEY, aes_decrypt, aes_encrypt, connect_and_login, ttlv_number
+from landbook_local_client import aes_decrypt, aes_encrypt, connect_and_login, ttlv_number
 
 
 def _is_debug():
@@ -34,93 +34,67 @@ def _dprint(*args, **kwargs):
 HEARTBEAT_INTERVAL     = 10    # LAN keepalive (seconds)
 MQTT_PING_INTERVAL     = 30    # MQTT keepalive
 FRAME_SILENCE_TIMEOUT  = 30    # come 0.2.7 veloce: tollera il ciclo bus_mask
-SENSOR_SOFT_SUBSCRIBE_AFTER = 0   # disattivato: la 0.2.7 veloce usa polling bus_mask
-SENSOR_SOFT_REFRESH_AFTER   = 0   # disattivato: evita recovery tardivi e doppi
-SENSOR_RECONNECT_AFTER      = 40  # freeze rapido: reconnect/evento se nessun sensore
+SENSOR_RECONNECT_AFTER      = 30  # dopo ~30s senza sensori: evento/riconnessione per automazioni HA
 SENSOR_SILENCE_TIMEOUT = SENSOR_RECONNECT_AFTER
 SENSOR_SILENCE_RESTART = 180  # dopo 3 min senza sensori: riavvio processo
 STARTUP_PRIMER_SUBSCRIBE_AFTER = 12  # sessione nata muta: ritenta presto la subscription
 STARTUP_PRIMER_MASK_AFTER      = 25  # sessione nata muta: richiedi solo i dati batteria/base
 REPORT_RESUBSCRIBE     = 120   # come 0.2.7 veloce: subscription rara
 BUS_MASK_INTERVAL      = 8     # logica veloce: full mask + refresh ogni 8s
-BUS_REFRESH_INTERVAL   = 30    # refresh standalone, ridondante rispetto a bus_mask
-FULL_BUS_MASK_COOLDOWN = 0     # 0.3.75: su sessione muta serve sempre ids=31 per riattivare i report
-# BATTERY_MASK_INTERVAL rimosso: 0x0003/0x0004 già inclusi in BUS_MASK_IDS(31);
-# il bus_mask periodico con 2 IDs causava WiFi freeze ogni 30s
 RECONNECT_DELAY_INIT   = 2.0   # recovery LAN rapido dopo freeze/unreachable
 RECONNECT_DELAY_MAX    = 5.0   # non aspettare 17/25/30s tra retry
 UNREACHABLE_RESTART    = 180   # restart process after 3 min unreachable
+UNREACHABLE_WIFI_FROZEN_ALERT = 30  # dopo ~30s LAN irraggiungibile: alert wifi_frozen
 BROKEN_PIPE_RESTART    = 30    # restart process after 30s broken-pipe loop
 FAULT_RECOVERY_MAX     = 3     # max retrigger E02 per sessione (evita loop)
 AVAILABILITY_HOLD      = 300   # hold MQTT "online" for 5 min during outage
+COMMAND_DUPLICATE_WINDOW = 0.8 # drop same command repeated by HA/UI immediately
+COMMAND_OPPOSITE_WINDOW  = 2.5 # drop fast ON/OFF or select A/B bounces
+GRID_OPPOSITE_WINDOW     = 3.0 # grid/micro-inverter is the most fragile command
 # ── WiFi freeze detection ─────────────────────────────────────────────────────
 # Il modulo WiFi della powerstation può congelare il task di reporting mantenendo
 # il TCP vivo (gli switch continuano a funzionare ma i sensori non arrivano).
 # Dopo WIFI_FROZEN_ALERT_AFTER: pubblica evento MQTT per automazioni HA.
-WIFI_FROZEN_ALERT_AFTER  = 1     # evento MQTT subito dopo circa 40s senza sensori
-WIFI_FROZEN_ALERT_COOLDOWN = 300 # evita riavvii router troppo frequenti
+WIFI_FROZEN_ALERT_AFTER  = 1     # evento MQTT al primo freeze rilevato
+WIFI_FROZEN_ALERT_COOLDOWN = 50  # consenti un nuovo alert dopo ~50s se il freeze persiste
 
 
 # ── Device identity ──────────────────────────────────────────────────────────
 DEVICE_KEY   = "000000000000"
-DEVICE_NAME  = "Landbook FPPT-T2400"
-APP_VERSION  = "0.3.82"
+DEVICE_NAME  = "Landbook LAN Device"
+def _read_app_version() -> str:
+    """Single source of truth: config.yaml. Avoids the trap where bumping the
+    addon required editing three identical strings (config.yaml, addon_run.py,
+    bridge) and the bridge banner ended up stale (0.3.84 long after 0.3.91)."""
+    for path in ("/app/config.yaml", "/data/config.yaml",
+                 os.path.join(os.path.dirname(__file__), "config.yaml")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("version:"):
+                        return line.split(":", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            continue
+    return "unknown"
+
+APP_VERSION  = _read_app_version()
+DISCOVERY_CACHE_PATH = "/data/discovered.json"
 OUTPUT_POWER_TAG = 0x00EA
 BUS_REFRESH_TAG  = 0x009A
 BUS_MASK_IDS = [
     0x001E, 0x0027, 0x0021, 0x001C, 0x0020, 0x0026, 0x0022, 0x001F,
     0x000B, 0x001D, 0x0010, 0x0011, 0x000D, 0x000A, 0x0005,
-    0x0008, 0x0009, 0x0003, 0x0006, 0x0002, 0x001B, 0x0010, 0x0001,
-    0x000F, 0x000C, 0x0011, 0x000E, 0x0004, 0x0012, 0x0029, 0x002A,
+    0x0008, 0x0009, 0x0003, 0x0006, 0x0002, 0x001B, 0x0001,
+    0x000F, 0x000C, 0x000E, 0x0004, 0x0012, 0x0029, 0x002A,
 ]
-BATTERY_MASK_IDS = [0x0003, 0x0004]
 
 
 # ── Switch / mode tables ─────────────────────────────────────────────────────
-SWITCH_HEX = {
-    "led": {
-        "name": "LED",
-        "on":  "AA AA 00 09 A9 02 8F 00 13 01 02 00 01",
-        "off": "AA AA 00 09 A9 02 90 00 13 01 02 00 00",
-    },
-    "ac": {
-        "name": "Presa AC",
-        "on":  "AA AA 00 07 A5 00 20 00 13 00 71",
-        "off": "AA AA 00 07 C7 00 43 00 13 00 70",
-    },
-    "dc": {
-        "name": "DC",
-        "on":  "AA AA 00 07 17 02 88 00 13 00 79",
-        "off": "AA AA 00 07 15 02 87 00 13 00 78",
-    },
-    "screen": {
-        "name": "Screen",
-        "on":  "AA AA 00 09 40 00 F9 00 13 01 32 00 00",
-        "off": "AA AA 00 09 2F 00 DE 00 13 01 32 00 0A",
-    },
-    "grid": {
-        "name": "Uscita Watt",
-        "on":  "AA AA 00 07 28 01 32 00 13 00 E1",
-        "off": "AA AA 00 07 24 01 2F 00 13 00 E0",
-    },
-    "beep": {
-        "name": "Beep",
-        "on":  "AA AA 00 07 0C 01 BD 00 13 01 39",
-        "off": "AA AA 00 07 08 01 BA 00 13 01 38",
-    },
-    "slow_reporting": {
-        "name": "Ricarica AC lenta",
-        "on":  "AA AA 00 07 06 01 E7 00 13 01 09",
-        "off": "AA AA 00 07 FD 01 DF 00 13 01 08",
-    },
-}
+SWITCH_HEX = {}  # populated from TSL BOOL controls at startup
 
-MODE_HEX_BY_LABEL = {
-    "PPS":                    "AA AA 00 09 06 00 19 00 13 00 DA 00 00",
-    "Micro-Inverter":         "AA AA 00 09 08 00 1A 00 13 00 DA 00 01",
-    "Power Reserve Priority": "AA AA 00 09 76 02 84 00 13 00 DA 00 02",
-}
-MODE_LABEL_BY_VAL = {0: "PPS", 1: "Micro-Inverter", 2: "Power Reserve Priority"}
+MODE_VALUE_BY_LABEL = {}
+MODE_LABEL_BY_VAL = {}
 
 AC_STATE_WORDS   = {0x0070: "OFF", 0x0071: "ON"}
 DC_STATE_WORDS   = {0x0078: "OFF", 0x0079: "ON"}
@@ -173,80 +147,56 @@ VALUE_STATES = {
     "led":   {0x0102: {0: "OFF", 1: "ON"}},
     "screen":{0x0132: {0: "ON", 10: "OFF"}},
 }
+LEGACY_COMMAND_STATE_CLEANUP = {"led", "screen", "high_frequency_reporting", "smart_socket_mode"}
 
-SWITCH_DISCOVERY_META = {
-    "ac":           {"icon": "mdi:power-socket-eu"},
-    "dc":           {"icon": "mdi:current-dc"},
-    "grid":         {"icon": "mdi:transmission-tower-export"},
-    "led":          {"icon": "mdi:led-on"},
-    "screen":       {"icon": "mdi:monitor"},
-    "beep":         {"icon": "mdi:volume-high"},
-    "slow_reporting": {"icon": "mdi:battery-charging-low"},
-}
+SWITCH_DISCOVERY_META = {}
 NON_CACHED_SWITCH_IDS = set(SWITCH_HEX.keys()) | {"mode"}
 
 
 # ── Sensor definitions ───────────────────────────────────────────────────────
-SENSOR_DEFS = {
-    "battery_percentage":           ("Battery",              "%",   "battery",     "measurement"),
-    "battery_voltage":              ("Battery Voltage",      "V",   "voltage",     "measurement"),
-    "battery_current":              ("Battery Current",      "A",   "current",     "measurement"),
-    "battery_temp":                 ("Battery Temp",         "°C",  "temperature", "measurement"),
-    "battery_total_power":          ("Battery Power",        "W",   "power",       "measurement"),
-    "battery_remaining_wh":         ("Battery Remaining",    "Wh",  "energy",      None),
-    "remaining_time_minutes":       ("Tempo residuo",        "h",   "duration",    "measurement"),
-    "pv_input_power":               ("PV Power",             "W",   "power",       "measurement"),
-    "pv_panel_voltage":             ("PV Panel Voltage",     "V",   "voltage",     "measurement"),
-    "grid_voltage":                 ("Grid Voltage",         "V",   "voltage",     "measurement"),
-    "grid_freq":                    ("Grid Frequency",       "Hz",  "frequency",   "measurement"),
-    "grid_b_power":                 ("Micro-Inverter Power", "W",   "power",       "measurement"),
-    "ac_input_power":               ("AC Input Power",       "W",   "power",       "measurement"),
-    "ac_output_power":              ("AC/uscita watt",       "W",   "power",       "measurement"),
-    "dc_output_power":              ("DC Output Power",      "W",   "power",       "measurement"),
-    "usb_a1_voltage":               ("USB A1 Voltage",       "V",   "voltage",     "measurement"),
-    "usb_a1_power":                 ("USB A1 Power",         "W",   "power",       "measurement"),
-    "usb_a1_current":               ("USB A1 Current",       "A",   "current",     "measurement"),
-    "usb_a2_voltage":               ("USB A2 Voltage",       "V",   "voltage",     "measurement"),
-    "usb_a2_power":                 ("USB A2 Power",         "W",   "power",       "measurement"),
-    "usb_a2_current":               ("USB A2 Current",       "A",   "current",     "measurement"),
-    "usb_a3_voltage":               ("USB A3 Voltage",       "V",   "voltage",     "measurement"),
-    "usb_a3_power":                 ("USB A3 Power",         "W",   "power",       "measurement"),
-    "usb_a3_current":               ("USB A3 Current",       "A",   "current",     "measurement"),
-    "usb_a4_voltage":               ("USB A4 Voltage",       "V",   "voltage",     "measurement"),
-    "usb_a4_power":                 ("USB A4 Power",         "W",   "power",       "measurement"),
-    "usb_a4_current":               ("USB A4 Current",       "A",   "current",     "measurement"),
-    "typec_1_voltage":              ("Type-C 1 Voltage",     "V",   "voltage",     "measurement"),
-    "typec_1_power":                ("Type-C 1 Power",       "W",   "power",       "measurement"),
-    "typec_1_current":              ("Type-C 1 Current",     "A",   "current",     "measurement"),
-    "typec_2_voltage":              ("Type-C 2 Voltage",     "V",   "voltage",     "measurement"),
-    "typec_2_power":                ("Type-C 2 Power",       "W",   "power",       "measurement"),
-    "typec_2_current":              ("Type-C 2 Current",     "A",   "current",     "measurement"),
-    "dc12v_voltage":                ("DC 12V Voltage",       "V",   "voltage",     "measurement"),
-    "dc12v_power":                  ("DC 12V Power",         "W",   "power",       "measurement"),
-    "dc12v_current":                ("DC 12V Current",       "A",   "current",     "measurement"),
-    "dc24v_voltage":                ("DC 24V Voltage",       "V",   "voltage",     "measurement"),
-    "dc24v_power":                  ("DC 24V Power",         "W",   "power",       "measurement"),
-    "dc24v_current":                ("DC 24V Current",       "A",   "current",     "measurement"),
-    "temp_inv":                     ("Inverter Temp",        "°C",  "temperature", "measurement"),
-    "temp_mppt":                    ("MPPT Temp",            "°C",  "temperature", "measurement"),
-    "temp_bms":                     ("BMS Temp",             "°C",  "temperature", "measurement"),
-    "total_input_power":            ("Total Input Power",    "W",   "power",       "measurement"),
-    "total_output_power":           ("Total Output Power",   "W",   "power",       "measurement"),
-    "device_status_raw":            ("Stato Device (num)",   None,  None,          None),
-    "device_status":                ("Stato Device",         None,  None,          None),
-    "fault_code":                   ("Codice Errore",        None,  None,          None),
-    "fault_code_raw":               ("Codice Errore (num)",  None,  None,          None),
-    "uptime_minutes_lan":           ("Uptime",               "min", "duration",    "total_increasing"),
-    "firmware_version_set":         ("Firmware Main",        None,  None,          None),
-    "firmware_version_bms":         ("Firmware BMS",         None,  None,          None),
-    "firmware_version_mppt":        ("Firmware MPPT",        None,  None,          None),
-    "firmware_version_inv":         ("Firmware INV",         None,  None,          None),
-    "battery_cycles":               ("Battery Cycles",       None,  None,          "total_increasing"),
-    "bms_allow_max_charge_current": ("BMS Max Charge Current","A",  "current",     "measurement"),
-    "bms_mos_status":               ("BMS MOS Status",       None,  None,          None),
-}
-for _cell in range(1, 14):
-    SENSOR_DEFS[f"battery_cell_{_cell:02d}_voltage"] = (f"Cell {_cell} Voltage", "V", "voltage", "measurement")
+SENSOR_DEFS = {}  # populated from TSL readable properties at startup
+
+# ── TSL-driven overlay ───────────────────────────────────────────────────────
+# The cloud TSL defines the readable/writable codes for the current model.
+# The LAN decoder then publishes only values actually observed from the device,
+# so new model-specific telemetry can appear without hard-coded entities.
+try:
+    from landbook_tsl_discovery import (
+        build_switch_hex_overlay as _build_switch_hex_overlay,
+        build_sensor_defs_overlay as _build_sensor_defs_overlay,
+        build_switch_meta_overlay as _build_switch_meta_overlay,
+        build_select_overlay     as _build_select_overlay_for_init,
+    )
+    _tsl_switch_overlay = _build_switch_hex_overlay(existing=SWITCH_HEX)
+    _tsl_sensor_overlay = _build_sensor_defs_overlay(existing=SENSOR_DEFS)
+    _tsl_switch_meta    = _build_switch_meta_overlay()
+    for k, v in _tsl_switch_overlay.items():
+        SWITCH_HEX[k] = v
+    for k, v in _tsl_sensor_overlay.items():
+        SENSOR_DEFS[k] = v
+    _removed_static_switches = []
+    for _sid in list(SWITCH_HEX):
+        if "id" not in SWITCH_HEX[_sid]:
+            _removed_static_switches.append(_sid)
+            del SWITCH_HEX[_sid]
+    # Keep curated baseline switches even when a richer TSL select exists on the
+    # same code. Example: LED can be exposed both as a quick ON/OFF switch and
+    # as a full brightness/effect select.
+    _shadowed_baseline = _removed_static_switches
+    if _is_debug():
+        print(f"[tsl_discovery] overlay applied: +{len(_tsl_switch_overlay)} switches "
+              f"({sorted(_tsl_switch_overlay.keys())}), +{len(_tsl_sensor_overlay)} sensors "
+              f"({sorted(_tsl_sensor_overlay.keys())}), "
+              f"baseline switches kept with selects: {sorted(SWITCH_HEX.keys())}", flush=True)
+    else:
+        print(f"[tsl_discovery] overlay applied: +{len(_tsl_switch_overlay)} switches, "
+              f"+{len(_tsl_sensor_overlay)} sensors", flush=True)
+    _BASELINE_SHADOWED_BY_SELECT = _shadowed_baseline
+except Exception as _exc:
+    print(f"[tsl_discovery] overlay skipped: {_exc}", flush=True)
+    _tsl_switch_meta = {}
+    _BASELINE_SHADOWED_BY_SELECT = []
+    SWITCH_HEX.clear()
 
 FIRMWARE_SENSOR_IDS = {"firmware_version_set", "firmware_version_bms", "firmware_version_mppt", "firmware_version_inv"}
 BMS_CELL_SENSOR_IDS = {f"battery_cell_{c:02d}_voltage" for c in range(1, 14)}
@@ -276,7 +226,6 @@ SENSOR_DISPLAY_PRECISION = {
     "usb_a3_voltage": 1, "usb_a3_current": 2, "usb_a4_voltage": 1, "usb_a4_current": 2,
     "typec_1_voltage": 1, "typec_1_current": 2, "typec_2_voltage": 1, "typec_2_current": 2,
     "dc12v_voltage": 1, "dc12v_current": 2, "dc24v_voltage": 1, "dc24v_current": 2,
-    "remaining_time_minutes": 2,
 }
 DC_OUTPUT_SENSOR_KEYS = (
     "dc_output_power",
@@ -290,35 +239,31 @@ DC_OUTPUT_SENSOR_KEYS = (
     "dc24v_voltage", "dc24v_power", "dc24v_current",
 )
 AC_TRANSIENT_ZERO_KEYS = ("grid_voltage", "grid_b_power", "ac_input_power", "ac_output_power")
+NON_MEANINGFUL_SENSOR_KEYS = {
+    "ac_data", "battery_data", "dc_data", "grid_data", "pv_data", "pack_data",
+    "measure_data", "temp_data_no", "bms_celldata_no", "work_profile",
+    "device_key", "device_type",
+    "output_power_set", "smart_socket_mode", "power_retention_set",
+    "high_frequency_reporting",
+}
+
+
+def _has_meaningful_sensor_data(decoded: dict) -> bool:
+    if not decoded:
+        return False
+    for key in decoded:
+        if key in NON_MEANINGFUL_SENSOR_KEYS:
+            continue
+        return True
+    return False
 
 # ── MQTT discovery: object_id identici all'integrazione custom ────────────────
-DEVICE_OBJECT_ID = "landbook_fppt_t2400"
+DEVICE_OBJECT_ID = "landbook"
 
-SENSOR_OBJECT_ID_OVERRIDES = {
-    "battery_percentage":     "battery",
-    "remaining_time_minutes": "remaining_time",
-    "grid_b_power":           "grid_power",
-    "temp_inv":               "inverter_temp",
-    "temp_mppt":              "mppt_temp",
-    "temp_bms":               "bms_temp",
-}
-
-SWITCH_OBJECT_ID_OVERRIDES = {
-    "ac":             "ac",
-    "dc":             "dc",
-    "led":            "led",
-    "grid":           "grid_power",
-    "beep":           "beep",
-    "screen":         "screen",
-    "slow_reporting": "slow_reporting",
-}
-
-_DIAGNOSTIC_SENSOR_IDS = {
-    "device_status_raw", "fault_code_raw", "work_profile", "uptime_minutes_lan",
-    "lan_status", "signal_strength_set", "temp_bms", "temp_inv", "temp_mppt",
-    "bms_allow_max_charge_current", "bms_mos_status",
-}
-_DIAGNOSTIC_PREFIXES = ("battery_cell_", "usb_a", "typec_", "dc12v_", "dc24v_")
+SENSOR_OBJECT_ID_OVERRIDES = {}
+SWITCH_OBJECT_ID_OVERRIDES = {}
+_DIAGNOSTIC_SENSOR_IDS = set()
+_DIAGNOSTIC_PREFIXES = ()
 
 
 def _entity_category(key: str):
@@ -687,11 +632,12 @@ def decode_bus_payload(plain: bytes) -> dict:
             out["grid_freq"] = freq
         if _between(power_raw, -10000, 10000):
             out["grid_voltage"] = voltage
-            out["grid_b_power"] = power_raw
             if power_raw < 0:
                 out["ac_input_power"] = abs(power_raw)
                 out["ac_output_power"] = 0
+                out["grid_b_power"] = 0
             else:
+                out["grid_b_power"] = power_raw
                 out["ac_output_power"] = power_raw
                 out["ac_input_power"] = 0
         else:
@@ -907,49 +853,45 @@ def publish_discovery(mqtt, base_topic, args):
         "identifiers": [device_key],
         "name": DEVICE_NAME,
         "manufacturer": "Landbook",
-        "model": "FPPT-T2400",
+        "model": os.environ.get("PRODUCT_KEY") or "TSL LAN device",
         "serial_number": device_key,
     }
     # Clean up any stale/obsolete sensor configs
     for sensor_id in ["output_power_set_guess", "soc_guess", "battery_cell_14_voltage",
                       "device_status_raw", "remaining_time_days", "pv_panel_power"]:
         mqtt.publish(f"homeassistant/sensor/{device_key}/{sensor_id}/config", b"", retain=True)
+    # Clean up entities that earlier add-on versions auto-discovered from the TSL
+    # but that we now know are duplicates, wrong type, or internal/diagnostic.
+    try:
+        from landbook_tsl_discovery import RETAINED_SWITCH_CLEANUP, RETAINED_SENSOR_CLEANUP, RETAINED_SELECT_CLEANUP
+    except ImportError:
+        RETAINED_SWITCH_CLEANUP, RETAINED_SENSOR_CLEANUP, RETAINED_SELECT_CLEANUP = [], [], []
+    for sw_id in RETAINED_SWITCH_CLEANUP:
+        mqtt.publish(f"homeassistant/switch/{device_key}/{sw_id}/config", b"", retain=True)
+    for sn_id in RETAINED_SENSOR_CLEANUP:
+        mqtt.publish(f"homeassistant/sensor/{device_key}/{sn_id}/config", b"", retain=True)
+    for select_id in RETAINED_SELECT_CLEANUP:
+        mqtt.publish(f"homeassistant/select/{device_key}/{select_id}/config", b"", retain=True)
+    # Compatibility cleanup for versions that temporarily replaced baseline
+    # switches with selects.
+    for sw_id in _BASELINE_SHADOWED_BY_SELECT:
+        mqtt.publish(f"homeassistant/switch/{device_key}/{sw_id}/config", b"", retain=True)
+    if RETAINED_SWITCH_CLEANUP or RETAINED_SENSOR_CLEANUP or RETAINED_SELECT_CLEANUP or _BASELINE_SHADOWED_BY_SELECT:
+        print(f"[discovery] cleared retained config for "
+              f"{len(RETAINED_SWITCH_CLEANUP) + len(_BASELINE_SHADOWED_BY_SELECT)} switches + "
+              f"{len(RETAINED_SENSOR_CLEANUP)} sensors + "
+              f"{len(RETAINED_SELECT_CLEANUP)} selects", flush=True)
     if not args.show_firmware_sensors:
         for sensor_id in FIRMWARE_SENSOR_IDS:
             mqtt.publish(f"homeassistant/sensor/{device_key}/{sensor_id}/config", b"", retain=True)
 
-    for sensor_id, (name, unit, device_class, state_class) in SENSOR_DEFS.items():
-        if sensor_id in FIRMWARE_SENSOR_IDS and not args.show_firmware_sensors:
-            continue
-        object_id = f"{DEVICE_OBJECT_ID}_{SENSOR_OBJECT_ID_OVERRIDES.get(sensor_id, sensor_id)}"
-        config = {
-            "name": name,
-            "object_id": object_id,
-            "has_entity_name": True,
-            "state_topic": f"{base_topic}/sensors/{sensor_id}",
-            "unique_id": f"{device_key}_{sensor_id}_v2" if sensor_id == "remaining_time_minutes" else f"{device_key}_{sensor_id}",
-            "device": device,
-            "availability_topic": f"{base_topic}/availability",
-        }
-        cat = _entity_category(sensor_id)
-        if cat:
-            config["entity_category"] = cat
-        if unit:
-            config["unit_of_measurement"] = unit
-        if device_class:
-            config["device_class"] = device_class
-        if state_class:
-            config["state_class"] = state_class
-        if sensor_id in SENSOR_DISPLAY_PRECISION:
-            config["suggested_display_precision"] = SENSOR_DISPLAY_PRECISION[sensor_id]
-        if sensor_id in EXPIRING_SENSOR_IDS:
-            config["force_update"] = True
-            expire = int(getattr(args, "sensor_expire_after", 0) or 0)
-            if sensor_id in BATTERY_INFO_SENSOR_IDS:
-                expire = int(getattr(args, "battery_info_expire_after", expire) or expire)
-            if expire > 0:
-                config["expire_after"] = expire
-        mqtt.publish(f"homeassistant/sensor/{device_key}/{sensor_id}/config", json.dumps(config), retain=True)
+    # Sensors are TSL-first but observed-only: clear retained configs at startup,
+    # then publish each sensor config only when a LAN report carries a real value.
+    # This avoids dozens of "Sconosciuto" sensors for cloud-only or unsupported
+    # TSL fields.
+    for sensor_id in SENSOR_DEFS:
+        mqtt.publish(f"homeassistant/sensor/{device_key}/{sensor_id}/config", b"", retain=True)
+    args._published_sensor_configs = set()
 
     for switch_id, switch in SWITCH_HEX.items():
         sw_object_id = f"{DEVICE_OBJECT_ID}_{SWITCH_OBJECT_ID_OVERRIDES.get(switch_id, switch_id)}"
@@ -966,44 +908,86 @@ def publish_discovery(mqtt, base_topic, args):
             "device": device,
             "availability_topic": f"{base_topic}/availability",
         }
-        config.update(SWITCH_DISCOVERY_META.get(switch_id, {}))
+        # Hardcoded meta wins (curated icons); TSL-inferred icons fill the gaps
+        # for switches we haven't customized yet (e.g. heater_switch on a new model).
+        meta = dict(_tsl_switch_meta.get(switch_id, {}))
+        meta.update(SWITCH_DISCOVERY_META.get(switch_id, {}))
+        config.update(meta)
         mqtt.publish(f"homeassistant/switch/{device_key}/{switch_id}/config", json.dumps(config), retain=True)
 
-    mqtt.publish(f"homeassistant/select/{device_key}/mode/config", json.dumps({
-        "name": "Modalita",
-        "object_id": f"{DEVICE_OBJECT_ID}_mode",
-        "has_entity_name": True,
-        "command_topic": f"{base_topic}/set/mode",
-        "state_topic": f"{base_topic}/cmd_state/mode",
-        "options": list(MODE_HEX_BY_LABEL),
-        "unique_id": f"{device_key}_mode",
-        "device": device,
-        "availability_topic": f"{base_topic}/availability",
-    }), retain=True)
+    # TSL-driven dynamic selects: every writable ENUM control becomes a HA select
+    # with the cloud official labels. No model-specific select is invented here.
+    try:
+        from landbook_tsl_discovery import build_select_overlay as _build_select_overlay
+        _tsl_select_overlay = _build_select_overlay(existing_switch_codes=set(SWITCH_HEX.keys()))
+    except Exception as _exc:
+        print(f"[tsl_discovery] select overlay skipped: {_exc}", flush=True)
+        _tsl_select_overlay = {}
+    for select_id, info in _tsl_select_overlay.items():
+        opts = info.get("options") or {}
+        if not opts:
+            continue
+        labels = [opts[k] for k in sorted(opts.keys())]
+        mqtt.publish(f"homeassistant/select/{device_key}/{select_id}/config", json.dumps({
+            "name": info.get("name") or select_id,
+            "object_id": f"{DEVICE_OBJECT_ID}_{select_id}",
+            "has_entity_name": True,
+            "command_topic": f"{base_topic}/set/{select_id}",
+            "state_topic": f"{base_topic}/cmd_state/{select_id}",
+            "options": labels,
+            "optimistic": False,
+            "unique_id": f"{device_key}_{select_id}",
+            "device": device,
+            "availability_topic": f"{base_topic}/availability",
+        }), retain=True)
+    args._tsl_select_catalog = _tsl_select_overlay
+    if _tsl_select_overlay:
+        print(f"[tsl_discovery] dynamic selects published: {sorted(_tsl_select_overlay.keys())}",
+              flush=True)
 
-    mqtt.publish(f"homeassistant/number/{device_key}/output_power_set/config", json.dumps({
-        "name": "Limite Micro-Inverter",
-        "object_id": f"{DEVICE_OBJECT_ID}_output_power_set",
-        "has_entity_name": True,
-        "command_topic": f"{base_topic}/set/output_power",
-        "state_topic": f"{base_topic}/cmd_state/output_power",
-        "min": getattr(args, "output_power_min", 100),
-        "max": getattr(args, "output_power_max", 800),
-        "step": getattr(args, "output_power_step", 10),
-        "mode": "slider",
-        "unit_of_measurement": "W",
-        "unique_id": f"{device_key}_output_power_set_number",
-        "device": device,
-        "availability_topic": f"{base_topic}/availability",
-    }), retain=True)
-
+    # TSL-driven dynamic numbers: every writable numeric control becomes a HA number.
+    try:
+        from landbook_tsl_discovery import build_number_overlay as _build_number_overlay
+        _tsl_number_overlay = _build_number_overlay()
+    except Exception as _exc:
+        print(f"[tsl_discovery] number overlay skipped: {_exc}", flush=True)
+        _tsl_number_overlay = {}
+    for number_id, info in _tsl_number_overlay.items():
+        min_value = info.get("min")
+        max_value = info.get("max")
+        step = info.get("step") or 1
+        cfg = {
+            "name": info.get("name") or number_id,
+            "object_id": f"{DEVICE_OBJECT_ID}_{number_id}",
+            "has_entity_name": True,
+            "command_topic": f"{base_topic}/set/{number_id}",
+            "state_topic": f"{base_topic}/cmd_state/{number_id}",
+            "step": step,
+            "mode": "slider",
+            "optimistic": False,
+            "unique_id": f"{device_key}_{number_id}",
+            "device": device,
+            "availability_topic": f"{base_topic}/availability",
+        }
+        if min_value is not None:
+            cfg["min"] = min_value
+        if max_value is not None:
+            cfg["max"] = max_value
+        mqtt.publish(f"homeassistant/number/{device_key}/{number_id}/config", json.dumps(cfg), retain=True)
+    args._tsl_number_catalog = _tsl_number_overlay
+    if _tsl_number_overlay:
+        print(f"[tsl_discovery] dynamic numbers published: {sorted(_tsl_number_overlay.keys())}",
+              flush=True)
     _dprint(f"published discovery {APP_VERSION}", flush=True)
 
 
-def subscribe_command_topics(mqtt, base_topic):
+def subscribe_command_topics(mqtt, base_topic, args=None):
     topics = [f"{base_topic}/set/{switch_id}" for switch_id in SWITCH_HEX]
-    topics.append(f"{base_topic}/set/mode")
-    topics.append(f"{base_topic}/set/output_power")
+    if args is not None:
+        for select_id in (getattr(args, "_tsl_select_catalog", {}) or {}):
+            topics.append(f"{base_topic}/set/{select_id}")
+        for number_id in (getattr(args, "_tsl_number_catalog", {}) or {}):
+            topics.append(f"{base_topic}/set/{number_id}")
     mqtt.subscribe(topics)
 
 
@@ -1029,23 +1013,95 @@ def _send_frame(sock, args, frame):
     args._last_device_tx = time.time()
 
 
-def _transparent_parts(frame_hex):
-    raw = bytes.fromhex(frame_hex.replace(" ", ""))
-    if len(raw) < 9 or raw[:2] != b"\xAA\xAA":
-        raise ValueError(f"invalid frame: {frame_hex}")
-    body_len = int.from_bytes(raw[2:4], "big")
-    if len(raw) != body_len + 4:
-        raise ValueError(f"invalid frame length: {frame_hex}")
-    return int.from_bytes(raw[7:9], "big"), raw[9:]  # cmd, payload
+_TSL_CONTROLS_CACHE = None
 
 
-def _build_write_frame(frame_hex, key, iv, args):
-    cmd, payload = _transparent_parts(frame_hex)
-    return encode_cmd(cmd, _next_packet_id(args), aes_encrypt(payload, key, iv))
+def _boolish(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "on", "yes", "y")
 
 
-def _build_output_power_frame(watts, key, iv, args):
-    payload = OUTPUT_POWER_TAG.to_bytes(2, "big") + b"\x01" + int(watts).to_bytes(2, "big")
+def _load_tsl_controls():
+    global _TSL_CONTROLS_CACHE
+    if _TSL_CONTROLS_CACHE is not None:
+        return _TSL_CONTROLS_CACHE
+    controls = {}
+    try:
+        with open(DISCOVERY_CACHE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        for raw_controls in (data.get("properties"), data.get("controls"), data.get("tsl_controls")):
+            if isinstance(raw_controls, list):
+                raw_controls = {
+                    str(item.get("code") or item.get("identifier") or item.get("identifierName")): item
+                    for item in raw_controls
+                    if isinstance(item, dict)
+                }
+            if isinstance(raw_controls, dict):
+                controls.update({str(k): v for k, v in raw_controls.items() if isinstance(v, dict)})
+    except Exception as exc:
+        _dprint(f"TSL controls cache unavailable: {exc}", flush=True)
+    _TSL_CONTROLS_CACHE = controls
+    return controls
+
+
+def _tsl_control_info(code, default_type=None):
+    info = dict(_load_tsl_controls().get(code) or {})
+    if default_type and "type" not in info:
+        info["type"] = default_type
+    control_id = info.get("id", info.get("abId", info.get("abid")))
+    if control_id is None:
+        raise ValueError(f"TSL control id not found for {code}")
+    info["id"] = int(control_id)
+    raw_type = str(info.get("type") or "").upper()
+    data_type = str(info.get("dataType") or info.get("valueType") or "").upper()
+    if raw_type in ("", "PROPERTY", "FUNCTION", "EVENT"):
+        raw_type = ""
+    info["type"] = data_type or raw_type or str(default_type or "ENUM").upper()
+    return info
+
+
+def _build_tsl_payload(control_info, value):
+    control_id = int(control_info["id"])
+    data_type = str(control_info.get("type") or control_info.get("dataType") or "ENUM").upper()
+    if data_type == "BOOL":
+        return ((control_id << 3) | (1 if _boolish(value) else 0)).to_bytes(2, "big")
+    if data_type in ("ENUM", "INT", "INTEGER", "LONG", "UINT", "UINT16", "UINT32"):
+        return ttlv_number(control_id, int(value))
+    if data_type in ("FLOAT", "DOUBLE"):
+        return ttlv_number(control_id, int(round(float(value))))
+    return ttlv_number(control_id, int(value))
+
+
+def _build_tsl_control_frame(code, value, key, iv, args, default_type=None):
+    info = _tsl_control_info(code, default_type)
+    payload = _build_tsl_payload(info, value)
+    if _is_debug() or getattr(args, "debug_tsl_commands", False):
+        print(
+            "TSL command "
+            f"code={code} id={info.get('id')} "
+            f"type={info.get('type') or info.get('dataType') or default_type} "
+            f"value={value} payload={payload.hex(' ')}",
+            flush=True,
+        )
+    return encode_cmd(0x0013, _next_packet_id(args), aes_encrypt(payload, key, iv))
+
+
+def _build_tsl_info_frame(info, value, key, iv, args, default_type=None):
+    merged = dict(info or {})
+    if default_type and "type" not in merged:
+        merged["type"] = default_type
+    payload = _build_tsl_payload(merged, value)
+    if _is_debug() or getattr(args, "debug_tsl_commands", False):
+        print(
+            "TSL command "
+            f"code={merged.get('code')} id={merged.get('id')} "
+            f"type={merged.get('type') or merged.get('dataType') or default_type} "
+            f"value={value} payload={payload.hex(' ')}",
+            flush=True,
+        )
     return encode_cmd(0x0013, _next_packet_id(args), aes_encrypt(payload, key, iv))
 
 
@@ -1108,6 +1164,19 @@ def cleanup_disabled_cache_files(args):
             _dprint(f"cache file cleanup failed ({path}): {exc}", flush=True)
 
 
+def publish_wifi_frozen_alert(mqtt, topic, *, reason, streak=None, duration=None):
+    payload = {
+        "reason": reason,
+        "ts": int(time.time()),
+        "message": "PowerStation WiFi/LAN reporting frozen. Riavviare il WiFi del router o la powerstation.",
+    }
+    if streak is not None:
+        payload["streak"] = int(streak)
+    if duration is not None:
+        payload["duration"] = int(duration)
+    mqtt.publish(f"{topic}/event/wifi_frozen", json.dumps(payload), retain=False)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Sensor publishing
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1115,17 +1184,348 @@ def cleanup_disabled_cache_files(args):
 def _sensor_value(key, value):
     if key == "remaining_time_minutes":
         try:
-            hours = round(float(value) / 60.0, 2)
+            text = str(value).strip().lower()
+            if "min" in text:
+                minutes = int(float(text.split("min", 1)[0].strip()))
+            else:
+                minutes = int(float(value))
         except (TypeError, ValueError):
             return value
-        return int(hours) if float(hours).is_integer() else hours
+        hours, mins = divmod(max(minutes, 0), 60)
+        if hours and mins:
+            return f"{hours}h {mins}min"
+        if hours:
+            return f"{hours}h"
+        return f"{mins}min"
     return value
 
 
-def publish_sensor_cache(mqtt, base_topic, cache, keys=None):
-    sensor_ids = SENSOR_DEFS if keys is None else [k for k in keys if k in SENSOR_DEFS]
+def _humanize_sensor_id(sensor_id: str) -> str:
+    overrides = {
+        "battery_percentage": "Battery",
+        "battery_remaining_wh": "Battery Remaining",
+        "battery_total_power": "Battery Power",
+        "grid_b_power": "Grid AC Power",
+        "grid_freq": "Grid Frequency",
+        "remaining_time_minutes": "Tempo residuo",
+    }
+    if sensor_id in overrides:
+        return overrides[sensor_id]
+    return " ".join(part.upper() if part in ("ac", "dc", "pv", "usb", "bms", "soc")
+                    else part.capitalize()
+                    for part in str(sensor_id).replace("-", "_").split("_") if part)
+
+
+def _infer_sensor_meta(sensor_id: str):
+    lc = str(sensor_id).lower()
+    name = _humanize_sensor_id(sensor_id)
+    unit = None
+    device_class = None
+    state_class = None
+    if "voltage" in lc or lc.endswith("_v"):
+        unit, device_class, state_class = "V", "voltage", "measurement"
+    elif "current" in lc:
+        unit, device_class, state_class = "A", "current", "measurement"
+    elif "power" in lc or lc.endswith("_w"):
+        unit, device_class, state_class = "W", "power", "measurement"
+    elif "frequency" in lc or "freq" in lc:
+        unit, device_class, state_class = "Hz", "frequency", "measurement"
+    elif "temp" in lc:
+        unit, device_class, state_class = "°C", "temperature", "measurement"
+    elif lc.endswith("_wh") or "_wh_" in lc:
+        unit, device_class, state_class = "Wh", "energy", "measurement"
+    elif "soc" in lc or "percentage" in lc:
+        unit, device_class, state_class = "%", "battery", "measurement"
+    elif lc == "remaining_time_minutes":
+        unit, device_class, state_class = None, None, None
+    elif "remaining_time" in lc or lc.endswith("_time"):
+        unit, device_class, state_class = "min", "duration", "measurement"
+    elif "cycle" in lc or "count" in lc:
+        state_class = "total_increasing"
+    return name, unit, device_class, state_class
+
+
+def _publish_walker_shadow(mqtt, base_topic: str, walker_out: dict, legacy_out: dict) -> None:
+    """Publish the TTLV walker output under <base_topic>/sensors_v2/ so the user
+    can compare it side-by-side with the legacy decoder before switching over.
+
+    A summary delta is also published once per frame on <base_topic>/walker_diff
+    so a Home Assistant template sensor (or `mosquitto_sub`) can spot drift."""
+    diff_keys = []
+    for code, val in walker_out.items():
+        mqtt.publish(f"{base_topic}/sensors_v2/{code}", str(val), retain=False)
+        legacy_val = legacy_out.get(code)
+        if legacy_val is None:
+            diff_keys.append(f"+{code}")
+        else:
+            try:
+                if abs(float(val) - float(legacy_val)) > 0.5:
+                    diff_keys.append(f"~{code}")
+            except (TypeError, ValueError):
+                if str(val) != str(legacy_val):
+                    diff_keys.append(f"~{code}")
+    for code in legacy_out:
+        if code not in walker_out:
+            diff_keys.append(f"-{code}")
+    if diff_keys:
+        mqtt.publish(f"{base_topic}/walker_diff", ",".join(sorted(diff_keys)), retain=False)
+
+
+_PUBLISHED_SENSOR_CONFIGS = set()
+
+_NON_SENSOR_EXACT = {
+    "ac_data", "battery_data", "dc_data", "grid_data", "pv_data", "pack_data",
+    "hmi_data", "temp_data", "bms_data", "bms_celldata", "measure_data",
+    "work_profile", "device_key", "device_dk", "device_type", "mac_set",
+    "output_power_set", "power_retention_set", "smart_socket_mode",
+    "timed_charge_connection", "timed_grid_connection",
+    "load_power_consumption", "solar_panel_power_generation", "power_generation",
+    "device_status_raw", "fault_code_raw", "signal_strength", "signalStrength",
+    "signal_strength_set",
+}
+
+_TSL_DUPLICATE_PREFERRED_KEYS = {
+    "soc": "battery_percentage",
+    "remaining_time": "remaining_time_minutes",
+    "pv_total_power": "pv_input_power",
+    "pv_1_power": "pv_input_power",
+    "pv_1_voltage": "pv_panel_voltage",
+    "grid_frequency": "grid_freq",
+    "ac_power": "ac_output_power",
+    "dc_total_power": "dc_output_power",
+    "battery_total_voltage": "battery_voltage",
+    "BatCycleCnt": "battery_cycles",
+    "AllowMaxChgCurr": "bms_allow_max_charge_current",
+    "MosStatus": "bms_mos_status",
+    "bms_mos_temp": "temp_bms",
+    "inv_temp_max": "temp_inv",
+    "mppt_temp_max": "temp_mppt",
+}
+_TSL_DUPLICATE_PREFERRED_KEYS.update({
+    "ac_data_ac_power": "ac_output_power",
+    "ac_data_ac_voltage": "ac_output_voltage",
+    "battery_data_soc": "battery_percentage",
+    "battery_data_battery_total_power": "battery_total_power",
+    "battery_data_battery_total_voltage": "battery_voltage",
+    "battery_data_remaining_time": "remaining_time_minutes",
+    "battery_data_battery_temp": "battery_temp",
+    "dc_data_dc_total_power": "dc_output_power",
+    "dc_data_dc_12v_power": "dc12v_power",
+    "dc_data_dc_12v_voltage": "dc12v_voltage",
+    "dc_data_dc_24v_power": "dc24v_power",
+    "dc_data_dc_24v_voltage": "dc24v_voltage",
+    "dc_data_typec_1_power": "typec_1_power",
+    "dc_data_typec_1_voltage": "typec_1_voltage",
+    "dc_data_typec_2_power": "typec_2_power",
+    "dc_data_typec_2_voltage": "typec_2_voltage",
+    "dc_data_usb_1_power": "usb_a1_power",
+    "dc_data_usb_1_voltage": "usb_a1_voltage",
+    "dc_data_usb_2_power": "usb_a2_power",
+    "dc_data_usb_2_voltage": "usb_a2_voltage",
+    "dc_data_usb_3_power": "usb_a3_power",
+    "dc_data_usb_3_voltage": "usb_a3_voltage",
+    "dc_data_usb_4_power": "usb_a4_power",
+    "dc_data_usb_4_voltage": "usb_a4_voltage",
+    "dc_12V_power": "dc12v_power",
+    "dc_12V_voltage": "dc12v_voltage",
+    "dc_24V_power": "dc24v_power",
+    "dc_24V_voltage": "dc24v_voltage",
+    "usb_1_power": "usb_a1_power",
+    "usb_1_voltage": "usb_a1_voltage",
+    "usb_2_power": "usb_a2_power",
+    "usb_2_voltage": "usb_a2_voltage",
+    "usb_3_power": "usb_a3_power",
+    "usb_3_voltage": "usb_a3_voltage",
+    "usb_4_power": "usb_a4_power",
+    "usb_4_voltage": "usb_a4_voltage",
+    "grid_data_grid_b_power": "grid_b_power",
+    "grid_data_grid_frequency": "grid_freq",
+    "grid_data_grid_voltage": "grid_voltage",
+    "pv_data_pv_total_power": "pv_input_power",
+    "pv_data_pv_1_power": "pv_input_power",
+    "pv_data_pv_1_voltage": "pv_panel_voltage",
+})
+for _cell in range(1, 15):
+    _TSL_DUPLICATE_PREFERRED_KEYS[f"CellVoltage{_cell}"] = f"battery_cell_{_cell:02d}_voltage"
+    _TSL_DUPLICATE_PREFERRED_KEYS[f"bms_celldata_no_cellvoltage{_cell}"] = f"battery_cell_{_cell:02d}_voltage"
+
+_INFER_NAME_KEYS = {
+    "ac_input_power", "ac_output_power", "ac_output_voltage",
+    "battery_current", "battery_cycles", "battery_percentage",
+    "battery_remaining_wh", "battery_total_power", "battery_voltage",
+    "bms_allow_max_charge_current", "bms_mos_status",
+    "dc_output_power", "dc12v_current", "dc12v_power", "dc12v_voltage",
+    "dc24v_current", "dc24v_power", "dc24v_voltage",
+    "device_status", "device_status_raw", "fault_code", "fault_code_raw",
+    "grid_b_power", "grid_freq", "grid_voltage",
+    "pv_input_power", "pv_panel_voltage", "remaining_time_minutes",
+    "temp_bms", "temp_inv", "temp_mppt",
+    "total_input_power", "total_output_power", "uptime_minutes_lan",
+    "typec_1_current", "typec_1_power", "typec_1_voltage",
+    "typec_2_current", "typec_2_power", "typec_2_voltage",
+    "usb_a1_current", "usb_a1_power", "usb_a1_voltage",
+    "usb_a2_current", "usb_a2_power", "usb_a2_voltage",
+    "usb_a3_current", "usb_a3_power", "usb_a3_voltage",
+    "usb_a4_current", "usb_a4_power", "usb_a4_voltage",
+}
+for _cell in range(1, 15):
+    _INFER_NAME_KEYS.add(f"battery_cell_{_cell:02d}_voltage")
+
+
+def _is_publishable_sensor(sensor_id, cache, args=None):
+    key = str(sensor_id)
+    if not key or key.startswith("_"):
+        return False
+    if key in _NON_SENSOR_EXACT or key.endswith("_data"):
+        return False
+    if key in SWITCH_HEX:
+        return False
+    if args is not None:
+        if key in (getattr(args, "_tsl_select_catalog", {}) or {}):
+            return False
+        if key in (getattr(args, "_tsl_number_catalog", {}) or {}):
+            return False
+    try:
+        info = _load_tsl_controls().get(key) or {}
+        if info.get("writable"):
+            return False
+    except Exception:
+        pass
+    preferred = _TSL_DUPLICATE_PREFERRED_KEYS.get(key)
+    if preferred and preferred in cache:
+        return False
+    try:
+        if key == "battery_total_voltage" and 0 < float(cache.get(key) or 0) < 10:
+            return False
+    except (TypeError, ValueError):
+        pass
+    return True
+
+
+def apply_tsl_preferred_aliases(decoded):
+    changed = set()
+
+    def _num(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _valid(preferred, value):
+        n = _num(value)
+        if n is None:
+            return True
+        if preferred == "battery_voltage":
+            return 40.0 <= n <= 70.0
+        if preferred == "battery_percentage":
+            return 0.0 <= n <= 100.0
+        if preferred == "remaining_time_minutes":
+            return 0.0 <= n <= 100000.0
+        if preferred == "grid_voltage":
+            return 0.0 <= n <= 300.0
+        if preferred == "pv_panel_voltage":
+            return 0.0 <= n <= 1000.0
+        if preferred.endswith("_voltage"):
+            return 0.0 <= n <= 300.0
+        if preferred.endswith("_power") or preferred in ("ac_input_power", "ac_output_power", "grid_b_power"):
+            return -10000.0 <= n <= 10000.0
+        return True
+
+    for source, preferred in _TSL_DUPLICATE_PREFERRED_KEYS.items():
+        if source not in decoded or preferred in decoded:
+            continue
+        value = decoded[source]
+        if not _valid(preferred, value):
+            continue
+        decoded[preferred] = value
+        changed.add(preferred)
+    return changed
+
+
+def apply_dc_sensor_zero_baseline(cache, decoded):
+    if decoded.get("dc_switch") is True or cache.get("dc_switch") is True:
+        return set()
+    if any(k in decoded for k in DC_OUTPUT_SENSOR_KEYS):
+        return set()
+    changed = set()
+    for key in DC_OUTPUT_SENSOR_KEYS:
+        if key not in cache:
+            decoded[key] = 0
+            changed.add(key)
+    return changed
+
+
+def apply_cell_voltage_total_fallback(cache, decoded):
+    if "battery_voltage" in decoded:
+        return set()
+    values = []
+    for cell in range(1, 14):
+        key = f"battery_cell_{cell:02d}_voltage"
+        value = decoded.get(key, cache.get(key))
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return set()
+        if value > 10:
+            value = value / 1000.0
+        if not 2.5 <= value <= 4.5:
+            return set()
+        values.append(value)
+    total = round(sum(values), 1)
+    if not 40.0 <= total <= 70.0:
+        return set()
+    decoded["battery_voltage"] = total
+    return {"battery_voltage"}
+
+
+def publish_sensor_discovery_config(mqtt, base_topic, sensor_id):
+    if sensor_id in _PUBLISHED_SENSOR_CONFIGS:
+        return
+    device_key = base_topic.rstrip("/").split("/")[-1] or DEVICE_KEY
+    device = {
+        "identifiers": [device_key],
+        "name": DEVICE_NAME,
+        "manufacturer": "Landbook",
+        "model": os.environ.get("PRODUCT_KEY") or "TSL LAN device",
+        "serial_number": device_key,
+    }
+    if (sensor_id in SENSOR_DEFS
+            and sensor_id not in _TSL_DUPLICATE_PREFERRED_KEYS
+            and sensor_id not in _INFER_NAME_KEYS):
+        name, unit, device_class, state_class = SENSOR_DEFS[sensor_id]
+    else:
+        name, unit, device_class, state_class = _infer_sensor_meta(sensor_id)
+    config = {
+        "name": name,
+        "object_id": f"{DEVICE_OBJECT_ID}_{sensor_id}",
+        "has_entity_name": True,
+        "state_topic": f"{base_topic}/sensors/{sensor_id}",
+        "unique_id": f"{device_key}_{sensor_id}",
+        "device": device,
+        "availability_topic": f"{base_topic}/availability",
+    }
+    cat = _entity_category(sensor_id)
+    if cat:
+        config["entity_category"] = cat
+    if unit:
+        config["unit_of_measurement"] = unit
+    if device_class:
+        config["device_class"] = device_class
+    if state_class:
+        config["state_class"] = state_class
+    if sensor_id in SENSOR_DISPLAY_PRECISION:
+        config["suggested_display_precision"] = SENSOR_DISPLAY_PRECISION[sensor_id]
+    if sensor_id in EXPIRING_SENSOR_IDS:
+        config["force_update"] = True
+    mqtt.publish(f"homeassistant/sensor/{device_key}/{sensor_id}/config", json.dumps(config), retain=True)
+    _PUBLISHED_SENSOR_CONFIGS.add(sensor_id)
+
+
+def publish_sensor_cache(mqtt, base_topic, cache, keys=None, args=None):
+    sensor_ids = list(cache.keys()) if keys is None else list(keys)
     for key in sensor_ids:
-        if key in cache:
+        if key in cache and _is_publishable_sensor(key, cache, args):
+            publish_sensor_discovery_config(mqtt, base_topic, key)
             mqtt.publish(f"{base_topic}/sensors/{key}", str(_sensor_value(key, cache[key])), retain=False)
 
 
@@ -1527,20 +1927,72 @@ def extract_reported_command_states(plain):
     return reported
 
 
-def publish_reported_command_states(mqtt, base_topic, reported):
+def _set_pending_command_state(args, command_id, value, seconds=45):
+    if args is None:
+        return
+    pending = getattr(args, "_pending_command_states", None)
+    if not isinstance(pending, dict):
+        pending = {}
+    pending[command_id] = {
+        "value": str(value),
+        "until": time.time() + float(seconds),
+    }
+    args._pending_command_states = pending
+
+
+def _command_state_allowed(args, command_id, value):
+    if args is None:
+        return True
+    pending = getattr(args, "_pending_command_states", None)
+    if not isinstance(pending, dict):
+        return True
+    wait = pending.get(command_id)
+    if not wait:
+        return True
+    expected = str(wait.get("value", ""))
+    current = str(value)
+    until = float(wait.get("until", 0) or 0)
+    now = time.time()
+    if current != expected and now <= until:
+        _dprint(f"ignored stale {command_id}={current}; waiting for {expected}", flush=True)
+        return False
+    pending.pop(command_id, None)
+    args._pending_command_states = pending
+    return True
+
+
+def publish_reported_command_states(mqtt, base_topic, reported, args=None):
+    filtered = {}
+    valid = set(SWITCH_HEX)
+    if args is not None:
+        valid.update((getattr(args, "_tsl_select_catalog", {}) or {}).keys())
+        valid.update((getattr(args, "_tsl_number_catalog", {}) or {}).keys())
     for command_id, value in reported.items():
+        if command_id not in valid:
+            continue
+        if command_id in LEGACY_COMMAND_STATE_CLEANUP:
+            continue
+        if not _command_state_allowed(args, command_id, value):
+            continue
         mqtt.publish(f"{base_topic}/cmd_state/{command_id}", value, retain=True)
-    save_switch_cache(reported)
+        filtered[command_id] = value
+    if filtered:
+        save_switch_cache(filtered)
 
 
-def publish_output_power_state(mqtt, base_topic, watts, source="LAN"):
+def publish_output_power_state(mqtt, base_topic, watts, source="LAN", args=None):
     try:
         watts = int(float(watts))
     except (TypeError, ValueError):
         return
     if not 100 <= watts <= 800:
         return
-    mqtt.publish(f"{base_topic}/cmd_state/output_power", str(watts), retain=True)
+    command_id = "output_power_set"
+    if args is not None and command_id not in (getattr(args, "_tsl_number_catalog", {}) or {}):
+        return
+    if not _command_state_allowed(args, command_id, str(watts)):
+        return
+    mqtt.publish(f"{base_topic}/cmd_state/{command_id}", str(watts), retain=True)
     _dprint(f"{source} output_power_set={watts}W", flush=True)
 
 
@@ -1549,7 +2001,7 @@ def _initial_command_states_from_env() -> dict:
     if not raw:
         return {}
     states = {}
-    valid = set(SWITCH_HEX) | {"mode", "output_power"}
+    valid = set(SWITCH_HEX)
     for part in raw.split(","):
         if "=" not in part:
             continue
@@ -1561,36 +2013,93 @@ def _initial_command_states_from_env() -> dict:
     return states
 
 
-def publish_initial_command_states(mqtt, base_topic):
+def publish_initial_command_states(mqtt, base_topic, args=None):
     initial = _initial_command_states_from_env()
+    for command_id in LEGACY_COMMAND_STATE_CLEANUP:
+        mqtt.publish(f"{base_topic}/cmd_state/{command_id}", b"", retain=True)
     for switch_id in SWITCH_HEX:
         mqtt.publish(f"{base_topic}/cmd_state/{switch_id}", initial.get(switch_id, b""), retain=True)
-    mqtt.publish(f"{base_topic}/cmd_state/mode", initial.get("mode", b""), retain=True)
-    mqtt.publish(f"{base_topic}/cmd_state/output_power", initial.get("output_power", b""), retain=True)
+    if args is not None:
+        for select_id, info in ((getattr(args, "_tsl_select_catalog", {}) or {}).items()):
+            current_label = info.get("current_label")
+            if current_label not in (None, ""):
+                mqtt.publish(f"{base_topic}/cmd_state/{select_id}", str(current_label), retain=True)
+        for number_id, info in ((getattr(args, "_tsl_number_catalog", {}) or {}).items()):
+            current_value = info.get("current_value")
+            if current_value not in (None, ""):
+                mqtt.publish(f"{base_topic}/cmd_state/{number_id}", str(current_value), retain=True)
     if initial:
-        save_switch_cache({k: v for k, v in initial.items() if k != "output_power"})
+        save_switch_cache(initial)
 
 
-def publish_inferred_command_states(mqtt, base_topic, cache, decoded):
+def publish_inferred_command_states(mqtt, base_topic, cache, decoded, args=None):
     inferred = {}
 
     def _num(key):
         try:
-            return float(cache.get(key) if key in cache else decoded.get(key) or 0)
+            return float(decoded.get(key) if key in decoded else cache.get(key) or 0)
         except (TypeError, ValueError):
             return 0.0
 
     # Segue le modifiche fatte dall'app usando solo prove fisiche dai sensori LAN.
     # Evita la vecchia scansione generica dei frame, che poteva creare switch falsi.
-    if any(k in decoded for k in ("grid_voltage", "grid_b_power", "ac_output_power")):
-        grid_power = max(abs(_num("grid_b_power")), abs(_num("ac_output_power")))
-        if grid_power >= 5:
+    grid_output_power = max(_num("grid_b_power"), _num("ac_output_power"))
+    if grid_output_power >= 5:
+        if args is not None:
+            args._grid_zero_reads = 0
+        inferred["grid"] = "ON"
+    elif "grid_power_switch_set" in decoded:
+        if bool(decoded.get("grid_power_switch_set")):
+            if args is not None:
+                args._grid_zero_reads = 0
             inferred["grid"] = "ON"
-        elif _num("grid_voltage") <= 1 and grid_power < 1:
+        else:
             inferred["grid"] = "OFF"
+    elif cache.get("grid_power_switch_set") is False:
+        inferred["grid"] = "OFF"
+    elif cache.get("grid_power_switch_set") is True:
+        inferred["grid"] = "ON"
+    elif any(k in decoded for k in ("grid_b_power", "ac_output_power", "ac_input_power")):
+        # During Output Priority / grid startup the LAN stream can briefly
+        # report 0 W even though the command bit and the output settle to ON a
+        # moment later. Do not turn the HA switch off on a single zero sample.
+        if args is None:
+            inferred["grid"] = "OFF"
+        else:
+            zero_reads = int(getattr(args, "_grid_zero_reads", 0) or 0) + 1
+            args._grid_zero_reads = zero_reads
+            if zero_reads >= 3:
+                inferred["grid"] = "OFF"
 
-    if any(k in decoded for k in (
-        "dc_output_power",
+    dc_power = max(
+        _num("dc_output_power"),
+        _num("dc12v_power"),
+        _num("dc24v_power"),
+        _num("typec_1_power"),
+        _num("typec_2_power"),
+        _num("usb_a1_power"),
+        _num("usb_a2_power"),
+        _num("usb_a3_power"),
+        _num("usb_a4_power"),
+    )
+    if decoded.get("dc_switch") is False:
+        inferred["dc"] = "OFF"
+    elif decoded.get("dc_switch") is True:
+        # Some LAN frames mark dc_switch=True when only the auxiliary/LED rail
+        # is awake (for example USB voltage present with 0-1 W). Do not flip
+        # the HA switch on unless there is real DC output or the user cache
+        # already says the switch is on.
+        if dc_power >= 3 or cache.get("dc_switch") is True:
+            inferred["dc"] = "ON"
+        elif cache.get("dc_switch") is False:
+            inferred["dc"] = "OFF"
+    elif cache.get("dc_switch") is False:
+        inferred["dc"] = "OFF"
+    elif cache.get("dc_switch") is True:
+        inferred["dc"] = "ON"
+    elif dc_power >= 3:
+        inferred["dc"] = "ON"
+    elif any(k in decoded for k in (
         "usb_a1_voltage",
         "usb_a2_voltage",
         "usb_a3_voltage",
@@ -1606,11 +2115,13 @@ def publish_inferred_command_states(mqtt, base_topic, cache, decoded):
             _num("dc12v_voltage"),
             _num("dc24v_voltage"),
         )
-        inferred["dc"] = "ON" if dc_voltage > 1 or _num("dc_output_power") > 1 else "OFF"
+        if dc_voltage <= 1:
+            inferred["dc"] = "OFF"
 
     if inferred:
-        publish_reported_command_states(mqtt, base_topic, inferred)
+        publish_reported_command_states(mqtt, base_topic, inferred, args)
         _dprint(f"inferred command states from sensors: {inferred}", flush=True)
+    return inferred
 
 
 def apply_reported_sensor_overrides(cache, reported):
@@ -1622,7 +2133,7 @@ def apply_reported_sensor_overrides(cache, reported):
         cache[key] = 0
 
     if reported.get("grid") == "OFF":
-        for key in ("grid_voltage", "grid_freq", "grid_b_power", "ac_input_power", "ac_output_power"):
+        for key in ("grid_b_power",):
             set_zero(key)
     if reported.get("dc") == "OFF":
         for key in DC_OUTPUT_SENSOR_KEYS:
@@ -1630,6 +2141,56 @@ def apply_reported_sensor_overrides(cache, reported):
     if changed:
         apply_derived_sensors(cache)
         changed.update(("total_input_power", "total_output_power"))
+    return changed
+
+
+def apply_explicit_switch_sensor_overrides(decoded, cache=None):
+    changed = set()
+    cache = cache or {}
+
+    def set_zero(key):
+        if decoded.get(key) != 0:
+            changed.add(key)
+        decoded[key] = 0
+
+    # The TSL switch state is authoritative. Some frames keep reporting a tiny
+    # phantom dc_output_power (observed 4 W) while the app and TSL say DC is off.
+    dc_is_off = decoded.get("dc_switch") is False or (
+        "dc_switch" not in decoded and cache.get("dc_switch") is False
+    )
+    if dc_is_off:
+        for key in DC_OUTPUT_SENSOR_KEYS:
+            set_zero(key)
+    return changed
+
+
+def apply_raw_status_labels(cache, decoded):
+    changed = set()
+
+    def unknownish(value):
+        if value is None:
+            return True
+        text = str(value).strip().lower()
+        return text in ("", "unknown", "sconosciuto", "none", "null")
+
+    if "device_status_raw" in decoded and unknownish(decoded.get("device_status")):
+        try:
+            raw = int(float(decoded["device_status_raw"]))
+            label = DEVICE_STATUS_LABELS.get(raw, f"Stato {raw}")
+            if cache.get("device_status") != label:
+                cache["device_status"] = label
+                changed.add("device_status")
+        except (TypeError, ValueError):
+            pass
+    if "fault_code_raw" in decoded and unknownish(decoded.get("fault_code")):
+        try:
+            raw = int(float(decoded["fault_code_raw"]))
+            label = FAULT_CODE_LABELS.get(raw, f"Errore E{raw}")
+            if cache.get("fault_code") != label:
+                cache["fault_code"] = label
+                changed.add("fault_code")
+        except (TypeError, ValueError):
+            pass
     return changed
 
 
@@ -1645,6 +2206,41 @@ def _normalize_output_power(value, args):
     return max(lo, min(hi, (watts // step) * step))
 
 
+def _command_tx_allowed(args, command_id, value, *, duplicate_window=None, opposite_window=None):
+    """Throttle HA command bounces before they reach the device Wi-Fi module."""
+    if args is None:
+        return True
+    now = time.time()
+    duplicate_window = (
+        float(duplicate_window)
+        if duplicate_window is not None
+        else float(getattr(args, "command_duplicate_window", COMMAND_DUPLICATE_WINDOW) or 0)
+    )
+    opposite_window = (
+        float(opposite_window)
+        if opposite_window is not None
+        else float(getattr(args, "command_opposite_window", COMMAND_OPPOSITE_WINDOW) or 0)
+    )
+    history = getattr(args, "_last_command_tx", None)
+    if not isinstance(history, dict):
+        history = {}
+    value = str(value)
+    last = history.get(command_id)
+    if last:
+        last_value = str(last.get("value", ""))
+        last_ts = float(last.get("ts", 0) or 0)
+        age = now - last_ts
+        if last_value == value and duplicate_window > 0 and age < duplicate_window:
+            print(f"ignored duplicate {command_id} command: {value}", flush=True)
+            return False
+        if last_value != value and opposite_window > 0 and age < opposite_window:
+            print(f"ignored rapid opposite {command_id} command: {last_value} -> {value}", flush=True)
+            return False
+    history[command_id] = {"value": value, "ts": now}
+    args._last_command_tx = history
+    return True
+
+
 def handle_mqtt_command(topic, payload, device_sock, mqtt, base_topic, key, iv, args):
     prefix = f"{base_topic}/set/"
     if not topic.startswith(prefix):
@@ -1658,37 +2254,70 @@ def handle_mqtt_command(topic, payload, device_sock, mqtt, base_topic, key, iv, 
         state = payload.upper()
         if state not in ("ON", "OFF"):
             return
-        if command_id == "grid":
-            last_state = getattr(args, "_last_grid_command_state", None)
-            last_ts = float(getattr(args, "_last_grid_command_ts", 0) or 0)
-            if last_state and last_state != state and time.time() - last_ts < 2.0:
-                print(f"ignored rapid opposite grid command: {last_state} -> {state}", flush=True)
-                return
-            args._last_grid_command_state = state
-            args._last_grid_command_ts = time.time()
-        frame = _build_write_frame(SWITCH_HEX[command_id][state.lower()], key, iv, args)
+        opposite_window = GRID_OPPOSITE_WINDOW if command_id == "grid" else None
+        if not _command_tx_allowed(args, command_id, state, opposite_window=opposite_window):
+            return
+        switch = SWITCH_HEX[command_id]
+        frame = _build_tsl_info_frame(switch, switch[state.lower()], key, iv, args, default_type=switch.get("type"))
         _send_frame(device_sock, args, frame)
+        _set_pending_command_state(args, command_id, state)
         mqtt.publish(f"{base_topic}/cmd_state/{command_id}", state, retain=True)
+        save_switch_cache({command_id: state})
         _dprint(f"sent {command_id} {state}", flush=True)
         args._next_bus_kick = time.time() + 2.0
         args._cmd_grace_until = time.time() + 60   # 60s grace dopo switch
         return
 
-    if command_id == "mode":
-        if payload not in MODE_HEX_BY_LABEL:
+    # Dynamic select handler: any TSL ENUM control we exposed as a HA select
+    # entity. The HA payload is the cloud label; we look up the int value via
+    # the cached select catalog and send it as an ENUM TTLV.
+    select_catalog = getattr(args, "_tsl_select_catalog", {}) or {}
+    if command_id in select_catalog:
+        info = select_catalog[command_id]
+        options = info.get("options") or {}
+        label_to_value = {str(v): int(k) for k, v in options.items()}
+        if payload not in label_to_value:
+            _dprint(f"select {command_id}: unknown label '{payload}', expected {list(label_to_value)}")
             return
-        frame = _build_write_frame(MODE_HEX_BY_LABEL[payload], key, iv, args)
+        if not _command_tx_allowed(args, command_id, payload):
+            return
+        frame = _build_tsl_info_frame(info, label_to_value[payload], key, iv, args, default_type="ENUM")
         _send_frame(device_sock, args, frame)
-        if payload == "Micro-Inverter":
-            _send_frame(device_sock, args, _build_write_frame(SWITCH_HEX["grid"]["on"], key, iv, args))
-            mqtt.publish(f"{base_topic}/cmd_state/grid", "ON", retain=True)
-        else:
-            _send_frame(device_sock, args, _build_write_frame(SWITCH_HEX["grid"]["off"], key, iv, args))
-            mqtt.publish(f"{base_topic}/cmd_state/grid", "OFF", retain=True)
-        mqtt.publish(f"{base_topic}/cmd_state/mode", payload, retain=True)
-        _dprint(f"sent mode {payload}", flush=True)
+        _set_pending_command_state(args, command_id, payload)
+        mqtt.publish(f"{base_topic}/cmd_state/{command_id}", payload, retain=True)
+        save_switch_cache({command_id: payload})
+        _dprint(f"sent {command_id}={payload} (value={label_to_value[payload]})", flush=True)
         args._next_bus_kick = time.time() + 2.0
-        args._cmd_grace_until = time.time() + 60   # 60s grace dopo cambio modalità
+        args._cmd_grace_until = time.time() + 60
+        return
+
+    number_catalog = getattr(args, "_tsl_number_catalog", {}) or {}
+    if command_id in number_catalog:
+        info = number_catalog[command_id]
+        try:
+            value = float(payload)
+        except ValueError:
+            return
+        step = float(info.get("step") or 1)
+        lo = info.get("min")
+        hi = info.get("max")
+        if lo is not None:
+            value = max(float(lo), value)
+        if hi is not None:
+            value = min(float(hi), value)
+        if step > 0:
+            value = round(value / step) * step
+        if float(value).is_integer():
+            value = int(value)
+        if not _command_tx_allowed(args, command_id, str(value), opposite_window=0.0):
+            return
+        frame = _build_tsl_info_frame(info, value, key, iv, args, default_type=info.get("type") or "INT")
+        _send_frame(device_sock, args, frame)
+        _set_pending_command_state(args, command_id, str(value), seconds=120)
+        mqtt.publish(f"{base_topic}/cmd_state/{command_id}", str(value), retain=True)
+        _dprint(f"sent {command_id}={value}", flush=True)
+        args._next_bus_kick = time.time() + 2.0
+        args._cmd_grace_until = time.time() + 60
         return
 
     if command_id == "output_power":
@@ -1696,8 +2325,17 @@ def handle_mqtt_command(topic, payload, device_sock, mqtt, base_topic, key, iv, 
             watts = _normalize_output_power(payload, args)
         except ValueError:
             return
+        if not _command_tx_allowed(
+            args,
+            "output_power",
+            str(watts),
+            duplicate_window=float(getattr(args, "output_power_debounce", 0.25) or 0.25),
+            opposite_window=0.0,
+        ):
+            return
         args._pending_output_power = watts
         args._pending_output_power_due = time.time() + float(getattr(args, "output_power_debounce", 0.25) or 0.25)
+        _set_pending_command_state(args, "output_power", str(watts), seconds=120)
         args._next_bus_kick = time.time() + 2.5
         _dprint(f"queued output_power {watts}W", flush=True)
 
@@ -1707,10 +2345,16 @@ def _flush_pending_output_power(device_sock, mqtt, base_topic, key, iv, args):
     due = getattr(args, "_pending_output_power_due", 0)
     if watts is None or time.time() < due:
         return
-    frame = _build_output_power_frame(watts, key, iv, args)
+    try:
+        output_info = _tsl_control_info("output_power_set", default_type="INT")
+        frame = _build_tsl_info_frame(output_info, watts, key, iv, args, default_type="INT")
+    except Exception as exc:
+        print(f"output_power_set TSL command unavailable: {exc}", flush=True)
+        args._pending_output_power = None
+        args._pending_output_power_due = 0
+        return
     _send_frame(device_sock, args, frame)
-    mqtt.publish(f"{base_topic}/cmd_state/output_power", str(watts), retain=True)
-    print(f"sent output_power {watts}W", flush=True)
+    print(f"sent output_power {watts}W; waiting for LAN confirmation", flush=True)
     args._pending_output_power = None
     args._pending_output_power_due = 0
     # Il device può bloccare il reporting per 60-120s mentre applica il nuovo
@@ -1723,6 +2367,39 @@ def _flush_pending_output_power(device_sock, mqtt, base_topic, key, iv, args):
 # LAN key refresh
 # ══════════════════════════════════════════════════════════════════════════════
 
+LAN_KEY_CACHE_PATH = "/data/landbook_lan_key.json"
+
+
+def _persist_lan_key_cache() -> None:
+    """Write the freshly-refreshed LAN key bundle to /data so the next addon restart
+    skips the cloud login."""
+    bundle = {
+        "email":       os.environ.get("WF_EMAIL", ""),
+        "platform":    os.environ.get("PLATFORM", "landbook"),
+        "lan_key_hex": os.environ.get("LAN_KEY_HEX", ""),
+        "device_key":  os.environ.get("DEVICE_KEY", ""),
+        "product_key": os.environ.get("PRODUCT_KEY", ""),
+        "saved_at":    int(time.time()),
+    }
+    if not bundle["lan_key_hex"] or not bundle["device_key"]:
+        return
+    try:
+        os.makedirs(os.path.dirname(LAN_KEY_CACHE_PATH), exist_ok=True)
+        with open(LAN_KEY_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(bundle, f)
+    except OSError as exc:
+        print(f"LAN key cache write failed: {exc}", flush=True)
+
+
+def _invalidate_lan_key_cache() -> None:
+    try:
+        os.remove(LAN_KEY_CACHE_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"LAN key cache invalidate failed: {exc}", flush=True)
+
+
 def _refresh_lan_key(args) -> bool:
     try:
         from wf_autodiscovery import setup as _setup
@@ -1732,64 +2409,13 @@ def _refresh_lan_key(args) -> bool:
             new_key = base64.b64encode(bytes.fromhex(new_hex)).decode("ascii")
             if new_key != args.key:
                 args.key = new_key
+                _persist_lan_key_cache()
                 print("LAN key refreshed from cloud", flush=True)
                 return True
         return False
     except Exception as exc:
         print(f"LAN key refresh failed: {exc}", flush=True)
         return False
-
-
-def _cloud_switch_states() -> dict:
-    try:
-        import requests as _req
-    except ImportError:
-        return {}
-    token        = os.environ.get("WF_TOKEN", "")
-    realtime_url = os.environ.get("REALTIME_ATTRS_URL", "")
-    device_key   = os.environ.get("DEVICE_KEY", "")
-    product_key  = os.environ.get("PRODUCT_KEY", "")
-    if not all((token, realtime_url, device_key, product_key)):
-        return {}
-    ATTR_MAP = {
-        "beepSwitch": "beep", "beep": "beep", "buzzer": "beep",
-        "gridSwitch": "grid", "grid": "grid", "gridOutput": "grid", "gridOutputSwitch": "grid",
-        "acSwitch": "ac", "ac": "ac", "acOutput": "ac", "acOutputSwitch": "ac",
-        "dcSwitch": "dc", "dc": "dc", "dcOutput": "dc", "dcOutputSwitch": "dc",
-        "ledSwitch": "led", "led": "led", "lightSwitch": "led",
-        "screenSwitch": "screen", "screen": "screen", "displaySwitch": "screen",
-        "slowReporting": "slow_reporting", "slowReport": "slow_reporting",
-    }
-    try:
-        auth = token if token.lower().startswith("bearer ") else f"Bearer {token}"
-        headers = {"Authorization": auth, "Content-Type": "application/json"}
-        j = None
-        for params in (
-            {"dk": device_key, "pk": product_key},
-            {"deviceKey": device_key, "productKey": product_key},
-        ):
-            r = _req.get(realtime_url, params=params, headers=headers, timeout=10)
-            candidate = r.json()
-            if candidate.get("code") == 200:
-                j = candidate
-                break
-        if j is None:
-            return {}
-        attrs = j.get("data") or {}
-        if isinstance(attrs, list):
-            attrs = {item.get("id", ""): item.get("val", "") for item in attrs if isinstance(item, dict)}
-        states = {}
-        for cloud_key, switch_id in ATTR_MAP.items():
-            if cloud_key in attrs and switch_id not in states:
-                val = str(attrs[cloud_key]).upper()
-                if val in ("1", "TRUE", "ON"):
-                    states[switch_id] = "ON"
-                elif val in ("0", "FALSE", "OFF"):
-                    states[switch_id] = "OFF"
-        return states
-    except Exception as exc:
-        _dprint(f"cloud switch states error: {exc}", flush=True)
-        return {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1814,9 +2440,9 @@ def run(args):
     mqtt.connect()
     print(f"MQTT connected; publishing discovery...", flush=True)
     publish_discovery(mqtt, args.topic, args)
-    subscribe_command_topics(mqtt, args.topic)
+    subscribe_command_topics(mqtt, args.topic, args)
 
-    publish_initial_command_states(mqtt, args.topic)
+    publish_initial_command_states(mqtt, args.topic, args)
     clear_retained_sensor_states(mqtt, args.topic)
     cleanup_disabled_cache_files(args)
 
@@ -1831,7 +2457,6 @@ def run(args):
     sensor_silence_since: float | None = None
     session_had_sensor_data = False  # questa sessione TCP ha ricevuto almeno un dato
     last_wifi_frozen_alert = 0.0
-    last_full_bus_mask = 0.0
 
     try:
         while True:
@@ -1871,17 +2496,7 @@ def run(args):
                 args._lan_packet_id = 1
                 time.sleep(1.0)  # grace period post-login prima dei comandi
                 send_report_subscription(sock, key, iv, args)
-                if FULL_BUS_MASK_COOLDOWN <= 0 or time.time() - last_full_bus_mask >= FULL_BUS_MASK_COOLDOWN:
-                    send_bus_mask(sock, key, iv, args)
-                    last_full_bus_mask = time.time()
-                else:
-                    # IMPORTANTISSIMO:
-                    # non sostituire la full mask con BATTERY_MASK_IDS(2) al reconnect.
-                    # Nei log reali questa sequenza ripetuta "ids=2" porta a sessioni mute
-                    # e impedisce il recupero stabile dei report LAN. Durante il cooldown
-                    # manteniamo solo subscription + refresh: basta per riagganciare lo stream
-                    # senza restringere la mask attiva del device.
-                    print("skipped full bus_mask: cooldown active; keeping previous report mask", flush=True)
+                send_bus_mask(sock, key, iv, args)
                 send_bus_refresh(sock, key, iv, args)          # modalità alta frequenza
 
                 # ── Drain comandi MQTT stantii ────────────────────────────────
@@ -1890,7 +2505,7 @@ def run(args):
                 # rx e verrebbero eseguiti tutti in sequenza appena il device torna
                 # online, causando comportamenti caotici (grid ON→OFF→ON→OFF).
                 # Scartiamo per ~1s qualsiasi comando accodato durante il disconnect.
-                _drain_end = time.time() + 1.0
+                _drain_end = time.time() + float(getattr(args, "mqtt_stale_drain_seconds", 2.0) or 2.0)
                 _drained = 0
                 while time.time() < _drain_end:
                     for _t, _p, _r in mqtt.read_messages():
@@ -1908,11 +2523,8 @@ def run(args):
                 last_sensor_rx = now
                 next_resubscribe  = now + REPORT_RESUBSCRIBE if REPORT_RESUBSCRIBE > 0 else 0
                 next_bus_mask     = now + BUS_MASK_INTERVAL if BUS_MASK_INTERVAL > 0 else 0
-                next_bus_refresh  = now + BUS_REFRESH_INTERVAL if BUS_REFRESH_INTERVAL > 0 else 0
                 startup_primer_subscribe_sent = False
                 startup_primer_mask_sent = False
-                sensor_soft_subscribe_sent = False
-                sensor_soft_refresh_sent = False
                 recv_buf = b""
 
                 while True:
@@ -1987,11 +2599,6 @@ def run(args):
                         send_bus_refresh(sock, key, iv, args)
                         next_bus_mask = now + BUS_MASK_INTERVAL
 
-                    # Refresh standalone, molto meno importante del full bus_mask.
-                    if BUS_REFRESH_INTERVAL > 0 and now >= next_bus_refresh:
-                        send_bus_refresh(sock, key, iv, args)
-                        next_bus_refresh = now + BUS_REFRESH_INTERVAL
-
                     for topic, payload, retained in mqtt.read_messages():
                         if retained:
                             _dprint(f"ignored retained MQTT command: {topic}={payload}", flush=True)
@@ -2007,7 +2614,7 @@ def run(args):
                     # ── Grid retrigger after fault recovery ───────────────────
                     if getattr(args, "_grid_fault_recovery", False):
                         args._grid_fault_recovery = False
-                        frame = _build_write_frame(SWITCH_HEX["grid"]["off"], key, iv, args)
+                        frame = _build_tsl_info_frame(SWITCH_HEX["grid"], False, key, iv, args, default_type="BOOL")
                         _send_frame(sock, args, frame)
                         mqtt.publish(f"{args.topic}/cmd_state/grid", "OFF", retain=True)
                         print("grid OFF (fault recovery — retrigger)", flush=True)
@@ -2016,7 +2623,7 @@ def run(args):
                     retrigger_due = getattr(args, "_grid_retrigger_on_due", 0) or 0
                     if retrigger_due and now >= retrigger_due:
                         args._grid_retrigger_on_due = 0
-                        frame = _build_write_frame(SWITCH_HEX["grid"]["on"], key, iv, args)
+                        frame = _build_tsl_info_frame(SWITCH_HEX["grid"], True, key, iv, args, default_type="BOOL")
                         _send_frame(sock, args, frame)
                         mqtt.publish(f"{args.topic}/cmd_state/grid", "ON", retain=True)
                         print("grid ON (fault recovery — retrigger)", flush=True)
@@ -2030,7 +2637,6 @@ def run(args):
                         send_bus_mask(sock, key, iv, args)
                         args._next_bus_kick = 0
                         next_bus_mask = now + BUS_MASK_INTERVAL if BUS_MASK_INTERVAL > 0 else 0
-                        next_bus_refresh  = now + BUS_REFRESH_INTERVAL if BUS_REFRESH_INTERVAL > 0 else 0
 
                     # ── Receive and decode LAN frames ────────────────────────
                     data = recv_some(sock, 0.2)
@@ -2068,30 +2674,98 @@ def run(args):
                                 args.topic,
                                 lan_power_state["output_power_set"],
                                 "LAN",
+                                args,
                             )
 
                         decoded = decode_bus_payload(plain)
+                        # The TSL-driven walker now runs alongside the legacy decoder
+                        # by default. It fills in fields the reverse-engineered patterns
+                        # don't know about (e.g. mode, power_retention_set, smart_socket_mode,
+                        # explicit ac_switch/dc_switch state, plus any new model's
+                        # properties). The legacy decoder still wins for keys both produce
+                        # — only fields walker discovers that the legacy missed are added.
+                        try:
+                            from landbook_ttlv_walker import decode_payload as _ttlv_decode
+                            walker_out = _ttlv_decode(plain) or {}
+                        except Exception as _exc:
+                            walker_out = {}
+                            print(f"ttlv walker error: {_exc}", flush=True)
+                        if walker_out:
+                            # Codes the legacy decoder already publishes as
+                            # human-readable labels (FAULT_CODE_LABELS,
+                            # DEVICE_STATUS_LABELS, mode select…). Letting the
+                            # walker overwrite them with raw ints would make HA
+                            # oscillate between "Normale" and "0".
+                            _LABELED_BY_LEGACY = {
+                                "fault_code", "fault_code_raw",
+                                "device_status", "device_status_raw",
+                                "device_status_corrected",
+                                "mode",
+                                "high_frequency_reporting",
+                            }
+                            for k, v in walker_out.items():
+                                if k in _LABELED_BY_LEGACY:
+                                    continue
+                                decoded[k] = v
+                            for _code in SWITCH_HEX:
+                                if _code not in walker_out:
+                                    continue
+                                _state = "ON" if bool(walker_out[_code]) else "OFF"
+                                if _command_state_allowed(args, _code, _state):
+                                    mqtt.publish(f"{args.topic}/cmd_state/{_code}", _state, retain=True)
+                            # Translate raw int values to TSL labels for any code
+                            # exposed as a HA select entity, then publish them as
+                            # the entity state so HA shows the human-readable
+                            # option (e.g. led_status_set=3 → "SOS").
+                            _select_cat = getattr(args, "_tsl_select_catalog", {}) or {}
+                            for _code, _info in _select_cat.items():
+                                if _code not in walker_out:
+                                    continue
+                                _opts = _info.get("options") or {}
+                                _raw = walker_out[_code]
+                                if isinstance(_raw, bool) and len(_opts) > 2:
+                                    _dprint(f"ignored ambiguous bool {_code}={_raw} for multi-option ENUM", flush=True)
+                                    continue
+                                try:
+                                    _label = _opts.get(int(_raw))
+                                except (TypeError, ValueError):
+                                    _label = None
+                                if _label and _command_state_allowed(args, _code, _label):
+                                    mqtt.publish(f"{args.topic}/cmd_state/{_code}", _label, retain=True)
+                            _number_cat = getattr(args, "_tsl_number_catalog", {}) or {}
+                            for _code in _number_cat:
+                                if _code in walker_out and _command_state_allowed(args, _code, str(walker_out[_code])):
+                                    mqtt.publish(f"{args.topic}/cmd_state/{_code}", str(walker_out[_code]), retain=True)
+                            if getattr(args, "use_ttlv_walker", False):
+                                # Diagnostic shadow publish when explicitly enabled.
+                                _publish_walker_shadow(mqtt, args.topic, walker_out, decoded)
                         if decoded:
+                            decoded.pop("high_frequency_reporting", None)
                             if not args.show_firmware_sensors:
                                 decoded = {k: v for k, v in decoded.items() if k not in FIRMWARE_SENSOR_IDS}
-                            if any(k in SENSOR_DEFS for k in decoded):
-                                last_sensor_rx = time.time()
-                                sensor_soft_subscribe_sent = False
-                                sensor_soft_refresh_sent = False
-                                sensor_silence_since = None
-                                sensor_silence_streak = 0
-                                args._cmd_grace_until = 0   # dati arrivati → grace non più necessaria
-                                if not session_had_sensor_data:
-                                    session_had_sensor_data = True
-                                    # Dati reali ricevuti: broken-pipe loop terminato
-                                    if broken_pipe_since is not None:
-                                        print(
-                                            f"broken-pipe loop terminato dopo "
-                                            f"{time.time() - broken_pipe_since:.0f}s — dati ricevuti",
-                                            flush=True,
-                                        )
-                                    broken_pipe_since = None
+                            if decoded:
+                                meaningful_sensor_data = _has_meaningful_sensor_data(decoded)
+                                if meaningful_sensor_data:
+                                    last_sensor_rx = time.time()
+                                    sensor_silence_since = None
+                                    sensor_silence_streak = 0
+                                    args._cmd_grace_until = 0   # dati arrivati → grace non più necessaria
+                                    if not session_had_sensor_data:
+                                        session_had_sensor_data = True
+                                        # Dati reali ricevuti: broken-pipe loop terminato
+                                        if broken_pipe_since is not None:
+                                            print(
+                                                f"broken-pipe loop terminato dopo "
+                                                f"{time.time() - broken_pipe_since:.0f}s — dati ricevuti",
+                                                flush=True,
+                                            )
+                                        broken_pipe_since = None
+                                else:
+                                    _dprint(f"ignored non-meaningful decoded payload: {decoded}", flush=True)
 
+                            alias_keys = apply_tsl_preferred_aliases(decoded)
+                            zero_baseline_keys = apply_dc_sensor_zero_baseline(sensor_cache, decoded)
+                            cell_voltage_keys = apply_cell_voltage_total_fallback(sensor_cache, decoded)
                             zero_values = zero_sensor_values_for_frame(sensor_cache, decoded)
                             if zero_values:
                                 decoded.update(zero_values)
@@ -2128,8 +2802,13 @@ def run(args):
                                             )
 
                             guard_zero_remaining_time(decoded, sensor_cache)
+                            explicit_override_keys = apply_explicit_switch_sensor_overrides(decoded, sensor_cache)
                             sensor_cache.update(decoded)
                             publish_keys = set(decoded)
+                            publish_keys.update(alias_keys)
+                            publish_keys.update(zero_baseline_keys)
+                            publish_keys.update(cell_voltage_keys)
+                            publish_keys.update(explicit_override_keys)
                             apply_derived_sensors(sensor_cache)
                             publish_keys.update(apply_battery_capacity_sensors(sensor_cache, decoded, args))
                             publish_keys.update(apply_grid_frequency_default(sensor_cache, decoded, args))
@@ -2139,14 +2818,15 @@ def run(args):
                                 publish_keys.add("total_output_power")
                             publish_keys.update(apply_battery_power_balance(sensor_cache, decoded, args))
                             publish_keys.update(apply_device_status_correction(sensor_cache, decoded))
+                            publish_keys.update(apply_raw_status_labels(sensor_cache, decoded))
                             publish_keys.update(apply_battery_soc_tracking(sensor_cache, decoded, args))
                             publish_keys.update(apply_battery_remaining_time_estimate(sensor_cache, args, decoded))
                             save_battery_cache(sensor_cache, decoded, args)
                             sensor_cache["updated_at"] = int(time.time())
-                            publish_sensor_cache(mqtt, args.topic, sensor_cache, publish_keys)
+                            publish_sensor_cache(mqtt, args.topic, sensor_cache, publish_keys, args)
                             if "output_power_set" in decoded:
-                                publish_output_power_state(mqtt, args.topic, decoded["output_power_set"], "LAN decoded")
-                            publish_inferred_command_states(mqtt, args.topic, sensor_cache, decoded)
+                                publish_output_power_state(mqtt, args.topic, decoded["output_power_set"], "LAN decoded", args)
+                            publish_inferred_command_states(mqtt, args.topic, sensor_cache, decoded, args)
                             if decoded:
                                 debug_decoded = dict(decoded)
                                 if "device_status_raw" in debug_decoded:
@@ -2156,12 +2836,12 @@ def run(args):
                         reported = extract_reported_command_states(plain) if len(plain) <= 96 else {}
                         if reported:
                             if "output_power" in reported:
-                                publish_output_power_state(mqtt, args.topic, reported["output_power"], "LAN reported")
-                            publish_reported_command_states(mqtt, args.topic, reported)
+                                publish_output_power_state(mqtt, args.topic, reported["output_power"], "LAN reported", args)
+                            publish_reported_command_states(mqtt, args.topic, reported, args)
                             override_keys = apply_reported_sensor_overrides(sensor_cache, reported)
                             if override_keys:
                                 sensor_cache["updated_at"] = int(time.time())
-                                publish_sensor_cache(mqtt, args.topic, sensor_cache, override_keys)
+                                publish_sensor_cache(mqtt, args.topic, sensor_cache, override_keys, args)
 
             except (OSError, RuntimeError) as exc:
                 now = time.time()
@@ -2179,6 +2859,17 @@ def run(args):
                 # Può accadere sia a inizio sessione (zombie puro) sia a metà
                 # sessione (freeze progressivo): contiamo entrambi i casi.
                 is_sensor_silence = "no sensor data" in exc_text
+                exc_errno = getattr(exc, "errno", None)
+                is_hard_unreachable = (
+                    exc_errno in {errno.EHOSTUNREACH, errno.ENETUNREACH} or
+                    any(s in exc_text for s in (
+                        "host is unreachable",
+                        "network is unreachable",
+                        "no route to host",
+                        "timed out",
+                        "connection reset by peer",
+                    ))
+                )
                 if is_sensor_silence:
                     # BUGFIX 0.3.52:
                     # prima lo streak veniva incrementato SOLO se la sessione aveva già
@@ -2209,18 +2900,12 @@ def run(args):
                             )
                         else:
                             try:
-                                mqtt.publish(
-                                    f"{args.topic}/event/wifi_frozen",
-                                    json.dumps({
-                                        "streak": sensor_silence_streak,
-                                        "ts": int(now),
-                                        "message": (
-                                            f"PowerStation WiFi reporting frozen "
-                                            f"({sensor_silence_streak} reconnects senza dati). "
-                                            "Riavviare il WiFi del router o la powerstation."
-                                        ),
-                                    }),
-                                    retain=False,
+                                publish_wifi_frozen_alert(
+                                    mqtt,
+                                    args.topic,
+                                    reason="sensor_silence",
+                                    streak=sensor_silence_streak,
+                                    duration=now - sensor_silence_since,
                                 )
                                 print(
                                     f"MQTT wifi_frozen alert pubblicato (streak={sensor_silence_streak})",
@@ -2256,11 +2941,6 @@ def run(args):
                     os.execv(sys.executable, [sys.executable] + sys.argv)
 
                 # Detect hard unreachability (WiFi/network down, not just device)
-                exc_errno = getattr(exc, "errno", None)
-                is_hard_unreachable = (
-                    exc_errno in {errno.EHOSTUNREACH, errno.ENETUNREACH} or
-                    any(s in exc_text for s in ("host is unreachable", "network is unreachable", "no route to host"))
-                )
                 if is_hard_unreachable:
                     if unreachable_since is None:
                         unreachable_since = now
@@ -2283,6 +2963,33 @@ def run(args):
 
                 print(f"LAN error: {exc}; reconnecting in {reconnect_delay:.0f}s", flush=True)
 
+                if unreachable_since is not None:
+                    unreachable_elapsed = now - unreachable_since
+                    if unreachable_elapsed >= UNREACHABLE_WIFI_FROZEN_ALERT:
+                        alert_elapsed = now - last_wifi_frozen_alert
+                        if last_wifi_frozen_alert and alert_elapsed < WIFI_FROZEN_ALERT_COOLDOWN:
+                            _dprint(
+                                f"MQTT wifi_frozen unreachable alert soppresso "
+                                f"(cooldown {WIFI_FROZEN_ALERT_COOLDOWN - alert_elapsed:.0f}s)",
+                                flush=True,
+                            )
+                        else:
+                            try:
+                                publish_wifi_frozen_alert(
+                                    mqtt,
+                                    args.topic,
+                                    reason="lan_unreachable",
+                                    duration=unreachable_elapsed,
+                                )
+                                print(
+                                    f"MQTT wifi_frozen alert pubblicato "
+                                    f"(LAN unreachable {unreachable_elapsed:.0f}s)",
+                                    flush=True,
+                                )
+                                last_wifi_frozen_alert = now
+                            except Exception as me:
+                                print(f"MQTT wifi_frozen publish failed: {me}", flush=True)
+
                 # Restart the process if the network has been hard-unreachable too long
                 # (handles the case where the WiFi router takes >3 min to come back)
                 if unreachable_since is not None and now - unreachable_since >= UNREACHABLE_RESTART:
@@ -2304,9 +3011,12 @@ def run(args):
                         pass
                     os.execv(sys.executable, [sys.executable] + sys.argv)
 
-                # Refresh LAN key on auth failure (unbind/rebind dall'app)
+                # Refresh LAN key on auth failure (unbind/rebind dall'app).
+                # The cached key is stale → wipe it before asking the cloud for a fresh one,
+                # so even if the refresh fails the next addon restart won't use the bad cache.
                 if "login failed" in exc_text:
-                    print("Login failed — refreshing LAN key from cloud", flush=True)
+                    print("Login failed — invalidating cached LAN key and refreshing from cloud", flush=True)
+                    _invalidate_lan_key_cache()
                     _refresh_lan_key(args)
 
                 if lan_disconnected_since is None:
@@ -2358,10 +3068,10 @@ def run(args):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Landbook FPPT-T2400 LAN -> HA MQTT bridge")
+    parser = argparse.ArgumentParser(description="Landbook FPPT-T2400 LAN -> HA MQTT bridge (0.3.85)")
     parser.add_argument("--device-host", default="192.168.1.65")
     parser.add_argument("--device-port", type=int, default=6607)
-    parser.add_argument("--key", default=DEFAULT_KEY)
+    parser.add_argument("--key", required=True, help="LAN key (base64). Retrieved by addon_run.py from the cloud or local cache.")
     parser.add_argument("--mqtt-host", default="core-mosquitto")
     parser.add_argument("--mqtt-port", type=int, default=1883)
     parser.add_argument("--mqtt-user")
@@ -2380,11 +3090,17 @@ def main():
     parser.add_argument("--sensor-expire-after", type=int, default=0)
     parser.add_argument("--battery-info-expire-after", type=int, default=86400)
     parser.add_argument("--show-firmware-sensors", action="store_true", default=False)
+    parser.add_argument("--use-ttlv-walker", action="store_true", default=False,
+                        help="Shadow-publish the TSL-driven TTLV walker output to <topic>/sensors_v2/<code> "
+                             "alongside the legacy decoder, for offline comparison.")
     parser.add_argument("--output-power-min", type=int, default=100)
     parser.add_argument("--output-power-max", type=int, default=800)
     parser.add_argument("--output-power-step", type=int, default=10)
     parser.add_argument("--output-power-debounce", type=float, default=0.25)
     parser.add_argument("--device-tx-min-interval", type=float, default=0.6)
+    parser.add_argument("--command-duplicate-window", type=float, default=COMMAND_DUPLICATE_WINDOW)
+    parser.add_argument("--command-opposite-window", type=float, default=COMMAND_OPPOSITE_WINDOW)
+    parser.add_argument("--mqtt-stale-drain-seconds", type=float, default=2.0)
     args = parser.parse_args()
     print(f"Landbook LAN MQTT Bridge {APP_VERSION} starting", flush=True)
     run(args)
@@ -2392,3 +3108,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

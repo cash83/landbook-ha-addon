@@ -7,7 +7,25 @@ import sys
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
 log = logging.getLogger("addon_run")
-APP_VERSION = "0.3.82"
+def _read_app_version() -> str:
+    """Read version from config.yaml so bumping the addon only requires
+    editing one file."""
+    for path in ("/app/config.yaml", "/data/config.yaml",
+                 os.path.join(os.path.dirname(__file__), "config.yaml")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("version:"):
+                        return line.split(":", 1)[1].strip().strip('"').strip("'")
+        except OSError:
+            continue
+    return "unknown"
+
+APP_VERSION = _read_app_version()
+
+LAN_KEY_CACHE_PATH = "/data/landbook_lan_key.json"
+TSL_CACHE_PATH     = "/data/landbook_tsl.json"
 
 
 def load_options():
@@ -16,6 +34,61 @@ def load_options():
         return {}
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_cached_lan_key(email: str, platform: str) -> dict:
+    """Return cached LAN key bundle if it matches the current account, else {}."""
+    try:
+        with open(LAN_KEY_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if data.get("email") != email or data.get("platform") != platform:
+        return {}
+    if not data.get("lan_key_hex") or not data.get("device_key"):
+        return {}
+    return data
+
+
+def _tsl_dump_is_fresh() -> bool:
+    """Return True if /data/landbook_tsl.json was written by the current parser.
+
+    Older addon versions wrote bundles with `specs=None` for ENUM properties
+    (the parser dropped list specs by mistake), which prevented HA selects from
+    being built. Detect those via a parser_version mismatch and trigger a cloud
+    refresh."""
+    try:
+        from wf_autodiscovery import TSL_PARSER_VERSION
+    except ImportError:
+        return True  # don't block boot if the module isn't importable yet
+    try:
+        with open(TSL_CACHE_PATH, "r", encoding="utf-8") as f:
+            bundle = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return int(bundle.get("parser_version", 0) or 0) >= int(TSL_PARSER_VERSION)
+
+
+def save_cached_lan_key(email: str, platform: str) -> None:
+    bundle = {
+        "email":       email,
+        "platform":    platform,
+        "lan_key_hex": os.environ.get("LAN_KEY_HEX", ""),
+        "device_key":  os.environ.get("DEVICE_KEY", ""),
+        "product_key": os.environ.get("PRODUCT_KEY", ""),
+        "saved_at":    int(__import__("time").time()),
+    }
+    if not bundle["lan_key_hex"] or not bundle["device_key"]:
+        return
+    try:
+        os.makedirs(os.path.dirname(LAN_KEY_CACHE_PATH), exist_ok=True)
+        with open(LAN_KEY_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(bundle, f)
+        log.info(f"LAN key cached in {LAN_KEY_CACHE_PATH}")
+    except OSError as e:
+        log.warning(f"LAN key cache write failed: {e}")
 
 
 def add_arg(args, name, value):
@@ -28,55 +101,63 @@ def add_arg(args, name, value):
     args.extend([f"--{cli_name}", str(value)])
 
 
-def _on_off(value):
-    val = str(value).strip().upper()
-    if val in ("1", "TRUE", "ON"):
-        return "ON"
-    if val in ("0", "FALSE", "OFF"):
-        return "OFF"
-    return None
+def run_autodiscovery(options, force_cloud: bool = False):
+    """Populate options["key"] and env vars from the cache or, as fallback, the cloud.
 
-
-def _resource_values(payload):
-    data = payload.get("data") or payload
-    if isinstance(data, dict) and isinstance(data.get("customizeTslInfo"), list):
-        values = {}
-        for item in data["customizeTslInfo"]:
-            code = item.get("resourceCode")
-            if not code:
-                continue
-            val = item.get("resourceValce")
-            try:
-                val = json.loads(val)
-            except Exception:
-                pass
-            values[code] = val
-        return values
-    if isinstance(data, list):
-        return {item.get("id", ""): item.get("val", "") for item in data if isinstance(item, dict)}
-    if isinstance(data, dict):
-        return data
-    return {}
-
-
-def run_autodiscovery(options):
+    Set force_cloud=True to bypass the local cache (used when LAN login fails with
+    auth errors, suggesting the cached key is stale).
+    """
     email    = str(options.get("wf_email", "")).strip()
     password = str(options.get("wf_password", "")).strip()
     if not email or not password:
         raise SystemExit("wf_email/wf_password obbligatori: la LAN key deve essere scoperta dal cloud")
     platform = str(options.get("app", "landbook")).strip().lower()
-    log.info(f"Cloud login: platform={platform} user={email[:3]}***")
     os.environ["WF_EMAIL"]    = email
     os.environ["WF_PASSWORD"] = password
     os.environ["PLATFORM"]    = platform
+    cached = {} if force_cloud else load_cached_lan_key(email, platform)
+
+    if not force_cloud:
+        if cached and _tsl_dump_is_fresh():
+            log.info(f"LAN key trovata in cache locale ({LAN_KEY_CACHE_PATH}) — cloud non contattato")
+            os.environ["LAN_KEY_HEX"] = cached["lan_key_hex"]
+            os.environ["DEVICE_KEY"]  = cached["device_key"]
+            if cached.get("product_key"):
+                os.environ["PRODUCT_KEY"] = cached["product_key"]
+            options["key"] = base64.b64encode(bytes.fromhex(cached["lan_key_hex"])).decode("ascii")
+            options["_device_key"] = cached["device_key"]
+            return
+        if cached:
+            log.info("LAN key in cache ma TSL dump obsoleto (parser version mismatch) — "
+                     "ricarico dal cloud per aggiornare lo schema")
+
+    log.info(f"Cloud login: platform={platform} user={email[:3]}***")
     try:
         from wf_autodiscovery import setup as autodiscovery_setup
         autodiscovery_setup(force=True)
     except SystemExit as e:
         log.error(f"Cloud login fallito: {e}")
+        if cached:
+            os.environ["LAN_KEY_HEX"] = cached["lan_key_hex"]
+            os.environ["DEVICE_KEY"] = cached["device_key"]
+            if cached.get("product_key"):
+                os.environ["PRODUCT_KEY"] = cached["product_key"]
+            options["key"] = base64.b64encode(bytes.fromhex(cached["lan_key_hex"])).decode("ascii")
+            options["_device_key"] = cached["device_key"]
+            log.warning("cloud non disponibile: uso LAN key in cache locale")
+            return
         raise
     except Exception as e:
         log.error(f"Cloud login errore: {e}")
+        if cached:
+            os.environ["LAN_KEY_HEX"] = cached["lan_key_hex"]
+            os.environ["DEVICE_KEY"] = cached["device_key"]
+            if cached.get("product_key"):
+                os.environ["PRODUCT_KEY"] = cached["product_key"]
+            options["key"] = base64.b64encode(bytes.fromhex(cached["lan_key_hex"])).decode("ascii")
+            options["_device_key"] = cached["device_key"]
+            log.warning("cloud non disponibile: uso LAN key in cache locale")
+            return
         raise
     lan_key_hex = os.environ.get("LAN_KEY_HEX", "").strip()
     if not lan_key_hex:
@@ -89,86 +170,7 @@ def run_autodiscovery(options):
     device_key = os.environ.get("DEVICE_KEY", "").strip()
     if device_key:
         options["_device_key"] = device_key
-
-
-def fetch_switch_states(options):
-    import requests as _req
-    token        = os.environ.get("WF_TOKEN", "")
-    realtime_url = os.environ.get("REALTIME_ATTRS_URL", "")
-    device_key   = os.environ.get("DEVICE_KEY", "")
-    product_key  = os.environ.get("PRODUCT_KEY", "")
-    if not all((token, realtime_url, device_key, product_key)):
-        return {}
-    try:
-        auth = token if token.lower().startswith("bearer ") else f"Bearer {token}"
-        headers = {"Authorization": auth, "Content-Type": "application/json"}
-        j = None
-        for params in (
-            {"dk": device_key, "pk": product_key},
-            {"deviceKey": device_key, "productKey": product_key},
-        ):
-            r = _req.get(realtime_url, params=params, headers=headers, timeout=10)
-            candidate = r.json()
-            if candidate.get("code") == 200:
-                j = candidate
-                break
-        if j is None:
-            return {}
-        attrs = _resource_values(j)
-        ATTR_MAP = {
-            "beepSwitch": "beep", "beep": "beep", "buzzer": "beep",
-            "gridSwitch": "grid", "grid": "grid", "gridOutput": "grid", "gridOutputSwitch": "grid",
-            "acSwitch": "ac", "ac": "ac", "acOutput": "ac", "acOutputSwitch": "ac",
-            "dcSwitch": "dc", "dc": "dc", "dcOutput": "dc", "dcOutputSwitch": "dc",
-            "ledSwitch": "led", "led": "led", "lightSwitch": "led",
-            "screenSwitch": "screen", "screen": "screen", "displaySwitch": "screen",
-            "slowReporting": "slow_reporting", "slowReport": "slow_reporting",
-        }
-        states = {}
-        for cloud_key, switch_id in ATTR_MAP.items():
-            if cloud_key in attrs and switch_id not in states:
-                state = _on_off(attrs[cloud_key])
-                if state:
-                    states[switch_id] = state
-        resource_bool_map = {
-            "ac_switch": "ac",
-            "dc_switch": "dc",
-            "grid_power_switch_set": "grid",
-            "beep_setting_set": "beep",
-            "ac_charging_limit_set": "slow_reporting",
-        }
-        for resource, switch_id in resource_bool_map.items():
-            if resource in attrs:
-                state = _on_off(attrs[resource])
-                if state:
-                    states[switch_id] = state
-        led = attrs.get("led_status_set")
-        if led is not None:
-            states["led"] = "OFF" if str(led).strip() == "0" else "ON"
-        screen = attrs.get("screen_sleeptime_set")
-        if screen is not None:
-            states["screen"] = "ON" if str(screen).strip() == "0" else "OFF"
-        mode = attrs.get("mode")
-        if mode is not None:
-            states["mode"] = {
-                "0": "PPS",
-                "1": "Micro-Inverter",
-                "2": "Power Reserve Priority",
-            }.get(str(mode).strip(), str(mode).strip())
-        output_power = attrs.get("output_power_set")
-        if output_power is not None:
-            try:
-                watts = int(float(output_power))
-                if 0 < watts <= 2000:
-                    states["output_power"] = str(watts)
-            except (TypeError, ValueError):
-                pass
-        if states:
-            log.info(f"Stati comandi dal cloud: {states}")
-        return states
-    except Exception as e:
-        log.debug(f"fetch_switch_states errore: {e}")
-        return {}
+    save_cached_lan_key(email, platform)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -200,6 +202,8 @@ cmd = [sys.executable, "/app/landbook_ha_mqtt_bridge.py"]
 for key in ("device_host", "device_port", "mqtt_host", "mqtt_port",
             "mqtt_user", "mqtt_password", "battery_capacity_wh", "key"):
     add_arg(cmd, key, options.get(key))
+if options.get("use_ttlv_walker"):
+    cmd.append("--use-ttlv-walker")
 add_arg(cmd, "device_key", device_key)
 add_arg(cmd, "topic", topic)
 

@@ -9,9 +9,6 @@ from Crypto.Cipher import AES
 from landbook_lan_probe import encode_cmd, hexs, iter_frames, recv_some
 
 
-DEFAULT_KEY = "YO6EBYHrW/6sx4QqfRAzVg=="
-
-
 def pad(data: bytes) -> bytes:
     n = 16 - (len(data) % 16)
     return data + bytes([n]) * n
@@ -89,7 +86,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="192.168.1.65")
     parser.add_argument("--port", type=int, default=6607)
-    parser.add_argument("--key", default=DEFAULT_KEY)
+    parser.add_argument("--key", required=True, help="LAN key (base64). Must be retrieved from the cloud and persisted by the addon.")
     parser.add_argument("--timeout", type=float, default=5)
     parser.add_argument("--seconds", type=float, default=60)
     args = parser.parse_args()
