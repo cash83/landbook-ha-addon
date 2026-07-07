@@ -1,4 +1,4 @@
-﻿"""TSL-driven Home Assistant discovery catalogs.
+"""TSL-driven Home Assistant discovery catalogs.
 
 Reads the TSL dump produced by wf_autodiscovery and yields the catalogs the
 bridge needs to (a) build MQTT discovery payloads for switches/sensors and
@@ -11,7 +11,6 @@ agnostic.
 
 import json
 import logging
-import os
 from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger("tsl_discovery")
@@ -47,8 +46,10 @@ UNIT_TO_DEVICE_CLASS = {
 # Some TSL units are written as raw enums (e.g. "Watt"); normalize before lookup.
 UNIT_ALIASES = {
     "Watt": "W", "Volt": "V", "Ampere": "A", "Hertz": "Hz",
-    "Celsius": "°C", "celsius": "°C", "degC": "°C",
+    "Celsius": "°C", "celsius": "°C", "degC": "°C", "℃": "°C",
     "percent": "%", "Percent": "%", "Percentage": "%",
+    "Minutes": "min", "Minute": "min", "minutes": "min", "minute": "min",
+    "kW.h": "kWh", "KW.h": "kWh", "kW·h": "kWh", "kw.h": "kWh",
 }
 
 
@@ -57,9 +58,14 @@ def _device_class(unit: Optional[str], code: str) -> Tuple[Optional[str], Option
         return None, "measurement"
     u = UNIT_ALIASES.get(unit, unit).strip()
     dc, sc = UNIT_TO_DEVICE_CLASS.get(u, (None, "measurement"))
+    lc = str(code).lower()
     # battery_percentage → battery device_class even though unit is %
-    if u == "%" and ("battery" in code.lower() or "soc" in code.lower()):
+    if u == "%" and ("battery" in lc or "soc" in lc):
         return "battery", "measurement"
+    # Remaining capacity is an instantaneous energy value, not an increasing total.
+    # HA rejects state_class=measurement with device_class=energy.
+    if u in ("Wh", "kWh") and "remaining" in lc:
+        return dc, None
     return dc, sc
 
 
@@ -69,7 +75,8 @@ def _unit_string(specs: Any) -> Optional[str]:
         for key in ("unit", "unitName", "unitDesc", "displayUnit", "symbol"):
             v = specs.get(key)
             if v:
-                return str(v).strip()
+                raw = str(v).strip()
+                return UNIT_ALIASES.get(raw, raw)
     return None
 
 
@@ -239,10 +246,10 @@ def get_switches() -> List[dict]:
             entry["max"]  = hi
             entry["step"] = _step(specs)
         else:
-            # unknown writable type → expose as switch with raw 1/0 — better than dropping
-            entry["kind"] = "switch"
-            entry["on"]   = 1
-            entry["off"]  = 0
+            # Complex writable ARRAY/STRUCT/TEXT controls need a dedicated UI
+            # and encoder. Do not expose them as fake switches: toggling one
+            # would send a meaningless 1/0 payload to schedules/measure_data.
+            continue
         out.append(entry)
     return out
 
@@ -286,7 +293,7 @@ def get_sensors() -> List[dict]:
     # Whole-tree skips: container properties whose children duplicate or
     # conflict with the curated baseline (pack_data battery_voltage vs
     # battery_data battery_total_voltage, etc.) — drop the entire branch.
-    _SKIP_TREE = set()
+    _SKIP_TREE = {"pack_data"}
 
     for code, info in props.items():
         if info.get("writable"):
@@ -314,16 +321,11 @@ def get_sensors() -> List[dict]:
     return out
 
 
-def get_controls_by_code() -> Dict[str, dict]:
-    """Raw lookup for the command sender: code → {id, type, specs}."""
-    return dict(load_bundle().get("controls") or {})
-
-
 # ── Bridge-shape adapters (legacy dict shapes) ────────────────────────────
 
 # These mirror the legacy SWITCH_HEX / SENSOR_DEFS dict shapes so the bridge
 # can `.update()` them with TSL-discovered extras without rewriting 30 call
-# sites. The bridge's hardcoded literals stay as the FPPT-T2400 baseline;
+# sites. The bridge's hardcoded literals stay as the Wonderfree/Landbook powerstation baseline;
 # whatever new codes the TSL adds (heater_switch on a different model, a new
 # pv_string_2_voltage, …) get layered on top automatically.
 
@@ -358,6 +360,18 @@ def _icon_for(code: str) -> Optional[str]:
 # from TSL code → bridge switch_id so we don't create duplicates.
 _BASELINE_SWITCH_CODE_TO_ID = {}
 
+# ENUM controls collapsed to a plain HA on/off switch instead of a multi-option
+# select. Value = the ENUM index considered "ON"; any other index (including
+# ones not listed) is reported as "OFF". Used for controls where only two
+# states matter day-to-day and the extra options are rarely changed from HA —
+# also sidesteps select entities flapping when the device firmware reports
+# this code inconsistently across different frame types (see led_status_set:
+# the "ON" index here is firmware-confirmed by a real TSL command in logs,
+# index 0 is "Off").
+ENUM_AS_SWITCH = {
+    "led_status_set": 1,   # 0=Off, 1=High Brightness (2=Low Brightness, 3=SOS, 4=Strobe not exposed)
+}
+
 # TSL items that are not real switches/sensors — internal metadata, counters,
 # or commands handled separately by the bridge.
 _TSL_NOISE_PATTERNS = ()
@@ -382,30 +396,6 @@ def _is_noise(code: str) -> bool:
         or any(p in lc for p in _TSL_NOISE_PATTERNS if not p.startswith("_"))
 
 
-def _baseline_codes_lower(existing_keys: set) -> set:
-    """Build a case-insensitive set of all codes already represented by the
-    baseline dict (keys + their `code` value when present)."""
-    out = {k.lower() for k in existing_keys}
-    return out
-
-
-def _enum_switch_values(code: str, options: Dict[int, str]) -> Optional[tuple]:
-    if not options:
-        return None
-    norm = {int(k): str(v).strip().lower() for k, v in options.items()}
-    off_values = [k for k, label in norm.items() if label in ("off", "disabled", "disable")]
-    if off_values:
-        off = off_values[0]
-        on_values = [k for k in sorted(norm) if k != off]
-        return (on_values[0], off) if on_values else None
-    if "screen" in code.lower():
-        never = [k for k, label in norm.items() if "never" in label]
-        if never:
-            timeout_values = [k for k in sorted(norm) if k != never[0]]
-            return (never[0], timeout_values[-1]) if timeout_values else None
-    return None
-
-
 def build_switch_hex_overlay(existing: Optional[Dict[str, dict]] = None) -> Dict[str, dict]:
     """Return BOOL controls from the TSL using the TSL code as the entity id."""
     existing = existing or {}
@@ -428,6 +418,28 @@ def build_switch_hex_overlay(existing: Optional[Dict[str, dict]] = None) -> Dict
             "on": True,
             "off": False,
         }
+    for code, on_value in ENUM_AS_SWITCH.items():
+        lc = code.lower()
+        if lc in existing_ids or lc in existing_codes or code in out:
+            continue
+        for sw in get_switches():
+            if sw["code"] != code or sw.get("kind") != "select":
+                continue
+            opts = sw.get("options") or {}
+            on_label = opts.get(on_value, "ON")
+            current_value = _normalize_current_value(sw.get("current_value"))
+            out[code] = {
+                "name": sw.get("name") or code,
+                "code": code,
+                "id": int(sw["id"]),
+                "type": "ENUM",
+                "on": on_value,
+                "off": 0 if on_value != 0 else 1,
+                "_on_label": on_label,
+            }
+            if isinstance(current_value, int):
+                out[code]["current_value"] = "ON" if current_value == on_value else "OFF"
+            break
     return out
 
 # Codes that have been previously published as MQTT discovery in earlier add-on
@@ -444,7 +456,7 @@ RETAINED_SWITCH_CLEANUP = [
     "high_frequency_reporting",
     "measure_data",
     "ac_switch", "dc_switch", "grid_power_switch_set",
-    "led_status_set", "beep_setting_set", "ac_charging_limit_set",
+    "beep_setting_set", "ac_charging_limit_set",
     # Any direct duplicate of the baseline internal names was published as a
     # separate switch in 0.3.86-first-run; clean them up.
 ]
@@ -452,39 +464,15 @@ RETAINED_SWITCH_CLEANUP = [
 RETAINED_SELECT_CLEANUP = [
     "high_frequency_reporting",
     "smart_socket_mode",
+    "led_status_set",
 ]
-
-def _debug_dump_tsl_state() -> None:
-    """One-shot diagnostic: print why the overlay produces 0 entries.
-
-    Called once at module-load when invoked from the bridge."""
-    bundle = load_bundle()
-    props = bundle.get("properties") or {}
-    print(f"[tsl_discovery DEBUG] bundle parser_version={bundle.get('parser_version')} "
-          f"properties_count={len(props)} controls_count={len(bundle.get('controls') or {})}",
-          flush=True)
-    enum_w = []
-    for code, info in props.items():
-        if not info.get("writable"):
-            continue
-        t = str(info.get("type") or "").upper()
-        if t != "ENUM":
-            continue
-        specs = info.get("specs")
-        opts_kind = type(specs).__name__
-        opts_len = len(specs) if isinstance(specs, (list, dict)) else 0
-        enum_w.append(f"{code}(id={info.get('id')},specs={opts_kind}[{opts_len}])")
-    print(f"[tsl_discovery DEBUG] writable ENUM properties: {enum_w}", flush=True)
-
 
 def build_select_overlay(existing_switch_codes: Optional[set] = None) -> Dict[str, dict]:
     """Return ENUM controls that should appear as HA `select` entities.
 
     Shape: {code: {name, id, type:"ENUM", options:{value_int: label_str}}}
-    Skips internal/noise codes. Codes mapped via _BASELINE_SWITCH_CODE_TO_ID
-    (led_status_set, screen_sleeptime_set, …) ARE intentionally included here:
-    the bridge then deletes their basic on/off baseline switch and replaces it
-    with this richer select entity carrying the cloud's official labels."""
+    Skips internal/noise codes and anything in ENUM_AS_SWITCH (those are
+    exposed as a plain on/off switch by build_switch_hex_overlay instead)."""
     existing_codes = {c.lower() for c in (existing_switch_codes or set())}
     out: Dict[str, dict] = {}
     for sw in get_switches():
@@ -492,7 +480,7 @@ def build_select_overlay(existing_switch_codes: Optional[set] = None) -> Dict[st
             continue
         code = sw["code"]
         lc = code.lower()
-        if lc in existing_codes:
+        if lc in existing_codes or code in ENUM_AS_SWITCH:
             continue
         options = sw.get("options") or {}
         if not options:

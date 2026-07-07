@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import socket
+import shutil
 import sys
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
@@ -52,6 +53,24 @@ def load_cached_lan_key(email: str, platform: str) -> dict:
     return data
 
 
+def apply_cached_lan_key(options: dict, cached: dict) -> None:
+    """Apply a cached LAN key only when the matching TSL cache is usable too."""
+    if not cached:
+        raise SystemExit("LAN key cache assente")
+    if not _tsl_dump_is_fresh():
+        raise SystemExit(
+            "cloud non disponibile e TSL cache mancante/obsoleta: impossibile avviare "
+            "il bridge TSL-only con la sola LAN key in cache"
+        )
+    os.environ["LAN_KEY_HEX"] = cached["lan_key_hex"]
+    os.environ["DEVICE_KEY"] = cached["device_key"]
+    if cached.get("product_key"):
+        os.environ["PRODUCT_KEY"] = cached["product_key"]
+    options["key"] = base64.b64encode(bytes.fromhex(cached["lan_key_hex"])).decode("ascii")
+    options["_device_key"] = cached["device_key"]
+    ensure_tsl_share_copy()
+
+
 def _tsl_dump_is_fresh() -> bool:
     """Return True if /data/landbook_tsl.json was written by the current parser.
 
@@ -70,6 +89,20 @@ def _tsl_dump_is_fresh() -> bool:
         return False
     return int(bundle.get("parser_version", 0) or 0) >= int(TSL_PARSER_VERSION)
 
+
+
+def ensure_tsl_share_copy() -> None:
+    """Expose the current TSL in /share at every boot, also when cloud is skipped.
+    This lets the user download/check the exact schema used by the add-on."""
+    src = TSL_CACHE_PATH
+    dst = "/share/landbook_tsl.json"
+    try:
+        if os.path.exists(src) and os.path.getsize(src) > 0:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(src, dst)
+            log.info(f"[TSL] Copia TSL salvata in {dst}")
+    except Exception as e:
+        log.warning(f"[TSL] copia in /share fallita: {e}")
 
 def save_cached_lan_key(email: str, platform: str) -> None:
     bundle = {
@@ -116,18 +149,16 @@ def run_autodiscovery(options, force_cloud: bool = False):
     os.environ["WF_PASSWORD"] = password
     os.environ["PLATFORM"]    = platform
     cached = {} if force_cloud else load_cached_lan_key(email, platform)
+    smart_sockets_enabled = bool(options.get("smart_sockets_enabled", True))
 
     if not force_cloud:
-        if cached and _tsl_dump_is_fresh():
+        if cached and _tsl_dump_is_fresh() and not smart_sockets_enabled:
             log.info(f"LAN key trovata in cache locale ({LAN_KEY_CACHE_PATH}) — cloud non contattato")
-            os.environ["LAN_KEY_HEX"] = cached["lan_key_hex"]
-            os.environ["DEVICE_KEY"]  = cached["device_key"]
-            if cached.get("product_key"):
-                os.environ["PRODUCT_KEY"] = cached["product_key"]
-            options["key"] = base64.b64encode(bytes.fromhex(cached["lan_key_hex"])).decode("ascii")
-            options["_device_key"] = cached["device_key"]
+            apply_cached_lan_key(options, cached)
             return
-        if cached:
+        if cached and _tsl_dump_is_fresh() and smart_sockets_enabled:
+            log.info("LAN key in cache: aggiorno comunque token/lista smart socket dal cloud")
+        if cached and not _tsl_dump_is_fresh():
             log.info("LAN key in cache ma TSL dump obsoleto (parser version mismatch) — "
                      "ricarico dal cloud per aggiornare lo schema")
 
@@ -138,25 +169,15 @@ def run_autodiscovery(options, force_cloud: bool = False):
     except SystemExit as e:
         log.error(f"Cloud login fallito: {e}")
         if cached:
-            os.environ["LAN_KEY_HEX"] = cached["lan_key_hex"]
-            os.environ["DEVICE_KEY"] = cached["device_key"]
-            if cached.get("product_key"):
-                os.environ["PRODUCT_KEY"] = cached["product_key"]
-            options["key"] = base64.b64encode(bytes.fromhex(cached["lan_key_hex"])).decode("ascii")
-            options["_device_key"] = cached["device_key"]
-            log.warning("cloud non disponibile: uso LAN key in cache locale")
+            apply_cached_lan_key(options, cached)
+            log.warning("cloud non disponibile: uso LAN key e TSL cache locale")
             return
         raise
     except Exception as e:
         log.error(f"Cloud login errore: {e}")
         if cached:
-            os.environ["LAN_KEY_HEX"] = cached["lan_key_hex"]
-            os.environ["DEVICE_KEY"] = cached["device_key"]
-            if cached.get("product_key"):
-                os.environ["PRODUCT_KEY"] = cached["product_key"]
-            options["key"] = base64.b64encode(bytes.fromhex(cached["lan_key_hex"])).decode("ascii")
-            options["_device_key"] = cached["device_key"]
-            log.warning("cloud non disponibile: uso LAN key in cache locale")
+            apply_cached_lan_key(options, cached)
+            log.warning("cloud non disponibile: uso LAN key e TSL cache locale")
             return
         raise
     lan_key_hex = os.environ.get("LAN_KEY_HEX", "").strip()
@@ -171,6 +192,7 @@ def run_autodiscovery(options, force_cloud: bool = False):
     if device_key:
         options["_device_key"] = device_key
     save_cached_lan_key(email, platform)
+    ensure_tsl_share_copy()
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -200,10 +222,14 @@ except Exception as exc:
 
 cmd = [sys.executable, "/app/landbook_ha_mqtt_bridge.py"]
 for key in ("device_host", "device_port", "mqtt_host", "mqtt_port",
-            "mqtt_user", "mqtt_password", "battery_capacity_wh", "key"):
+            "mqtt_user", "mqtt_password", "battery_capacity_wh",
+            "smart_socket_poll_interval",
+            "smart_socket_1_device_key", "smart_socket_1_product_key", "smart_socket_1_name",
+            "smart_socket_2_device_key", "smart_socket_2_product_key", "smart_socket_2_name",
+            "key"):
     add_arg(cmd, key, options.get(key))
-if options.get("use_ttlv_walker"):
-    cmd.append("--use-ttlv-walker")
+add_arg(cmd, "freeze_detection_enabled", bool(options.get("freeze_detection_enabled", True)))
+add_arg(cmd, "smart_sockets_enabled", bool(options.get("smart_sockets_enabled", True)))
 add_arg(cmd, "device_key", device_key)
 add_arg(cmd, "topic", topic)
 

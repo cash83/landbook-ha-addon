@@ -1,4 +1,4 @@
-﻿"""wf_autodiscovery.py - Auto-discovery generica per bridge Acceleronix
+"""wf_autodiscovery.py - Auto-discovery generica per bridge Acceleronix
 
 Con il campo 'platform' nel config, tutti i parametri tecnici
 (base_url, accel_url, wf_domain, secret_suffix, realtime_attrs_url)
@@ -363,6 +363,63 @@ def _parse_device(dev: Any) -> tuple[str, str]:
     return dk, pk
 
 
+_POWERSTATION_PRODUCT_KEYS = {"p11tpn", "p11uve"}
+_POWERSTATION_NAME_HINTS = ("fppt", "t2400", "powerstation", "power station", "portable energy")
+_SOCKET_PRODUCT_KEYS = {"p11spk"}
+_SOCKET_NAME_HINTS = ("socket", "plug", "presa")
+
+
+def _extract_socket_devices(devices: List[dict]) -> List[dict]:
+    out: List[dict] = []
+    seen = set()
+    for dev in devices or []:
+        dk, pk = _parse_device(dev)
+        pk_l = str(pk or "").strip().lower()
+        if pk_l not in _SOCKET_PRODUCT_KEYS:
+            continue
+        if dk in seen:
+            continue
+        seen.add(dk)
+        out.append({
+            "device_key": dk,
+            "product_key": pk,
+            "name": str(dev.get("deviceName") or dev.get("name") or dk),
+            "product_name": str(dev.get("productName") or "Smart socket"),
+            "online": bool(dev.get("onlineStatus", 0) or dev.get("status", 0)),
+            "signal_strength": dev.get("signalStrength"),
+        })
+    return out
+
+
+def _device_selection_score(dev: dict) -> int:
+    dk, pk = _parse_device(dev)
+    pk_l = str(pk or "").strip().lower()
+    name_l = str(dev.get("deviceName") or dev.get("name") or "").strip().lower()
+    score = 0
+    if pk_l in _POWERSTATION_PRODUCT_KEYS:
+        score += 100
+    if any(hint in name_l for hint in _POWERSTATION_NAME_HINTS):
+        score += 30
+    if pk_l in _SOCKET_PRODUCT_KEYS:
+        score -= 100
+    if any(hint in name_l for hint in _SOCKET_NAME_HINTS):
+        score -= 30
+    if dk:
+        score += 1
+    return score
+
+
+def _select_default_device(devices: List[dict]) -> dict:
+    if not devices:
+        return {}
+    ranked = sorted(
+        enumerate(devices),
+        key=lambda item: (_device_selection_score(item[1]), -item[0]),
+        reverse=True,
+    )
+    return ranked[0][1]
+
+
 def _parse_tsl_controls(raw: Any) -> Dict[str, dict]:
     if isinstance(raw, dict):
         data = raw.get("data", raw)
@@ -419,7 +476,13 @@ def _parse_tsl_controls(raw: Any) -> Dict[str, dict]:
             or item.get("name")
             or ""
         ).strip()
-        control_id = item.get("id", item.get("abId", item.get("abid")))
+        control_id = (
+            item.get("id", item.get("abId", item.get("abid")))
+            or item.get("resourceId")
+            or item.get("attributeId")
+            or item.get("attrId")
+            or item.get("paramId")
+        )
         if not code or control_id is None:
             continue
         data_type = str(
@@ -443,10 +506,11 @@ def _parse_tsl_controls(raw: Any) -> Dict[str, dict]:
 
 
 TSL_DUMP_PATH = "/data/landbook_tsl.json"
+TSL_SHARE_DUMP_PATH = "/share/landbook_tsl.json"
 
 # Bump whenever the parser shape changes — addon_run.py uses this to detect a
 # stale TSL dump written by a previous addon version and force a cloud refresh.
-TSL_PARSER_VERSION = 5
+TSL_PARSER_VERSION = 7
 
 
 def _parse_tsl_properties(raw: Any) -> Dict[str, dict]:
@@ -484,7 +548,7 @@ def _parse_tsl_properties(raw: Any) -> Dict[str, dict]:
     # endpoints. We try them all rather than guessing per endpoint.
     CODE_KEYS  = ("code", "resourceCode", "attributeCode", "attrCode",
                   "identifier", "identifierName", "paramCode", "name")
-    ID_KEYS    = ("id", "abId", "abid", "paramId", "fieldId", "attrId", "tagId")
+    ID_KEYS    = ("id", "abId", "abid", "resourceId", "attributeId", "attrId", "paramId", "fieldId", "tagId")
     TYPE_KEYS  = ("dataType", "type", "valueType", "paramType")
     SPECS_KEYS = ("specs", "define", "schema", "specsList", "specsValue")
     SUB_KEYS   = ("subAttributes", "subItems", "subFields", "children",
@@ -622,6 +686,16 @@ def _dump_tsl_to_data(raw_responses: list, controls: Dict[str, dict],
             json.dump(bundle, f, ensure_ascii=False)
         log.info(f"[AUTODISCOVERY] TSL dump scritto in {TSL_DUMP_PATH} "
                  f"(controls={len(controls)} properties={len(properties)} raw={len(raw_responses)})")
+
+        # Copia consultabile dall'utente in /share. Il bridge continua a usare
+        # /data per il runtime, ma ogni nuovo TSL viene salvato anche qui.
+        try:
+            os.makedirs(os.path.dirname(TSL_SHARE_DUMP_PATH), exist_ok=True)
+            with open(TSL_SHARE_DUMP_PATH, "w", encoding="utf-8") as f:
+                json.dump(bundle, f, ensure_ascii=False, indent=2)
+            log.info(f"[AUTODISCOVERY] Copia TSL salvata in {TSL_SHARE_DUMP_PATH}")
+        except OSError as e:
+            log.warning(f"[AUTODISCOVERY] TSL share dump write failed: {e}")
     except OSError as e:
         log.warning(f"[AUTODISCOVERY] TSL dump write failed: {e}")
 
@@ -991,6 +1065,7 @@ def setup(force: bool = False) -> None:
 
     # ── Device list ───────────────────────────────────────────────────────
     selected_device: Optional[dict] = None
+    devices: List[dict] = []
     if not device_key or not product_key or (want_lan_auto and not lan_key_hex):
         log.info("[AUTODISCOVERY] Cerco dispositivi...")
         devices = _get_devices(base_url, token, headers)
@@ -1007,7 +1082,14 @@ def setup(force: bool = False) -> None:
                 dk, pk = _parse_device(d)
                 log.info(f"  [{i}] dk={mask_value(dk)}  pk={mask_value(pk)}  name={d.get('deviceName','?')}")
 
-        selected_device = devices[0]
+        selected_device = _select_default_device(devices)
+        if selected_device is not devices[0]:
+            dk, pk = _parse_device(selected_device)
+            log.info(
+                f"[AUTODISCOVERY] Uso dispositivo powerstation: "
+                f"dk={mask_value(dk)} pk={mask_value(pk)} "
+                f"name={selected_device.get('deviceName','?')}"
+            )
         if preferred_device_key:
             preferred = str(preferred_device_key).strip()
             for d in devices:
@@ -1057,15 +1139,20 @@ def setup(force: bool = False) -> None:
 
     discovered = {
         "wf_domain":    domain,
+        "base_url":     base_url,
+        "accel_url":    os.getenv("ACCEL_URL", ""),
         "device_key":   device_key,
         "product_key":  product_key,
         "accel_client": accel_cli,
         "lan_key_hex":  lan_key_hex,
         "token":        token,
     }
+    socket_devices = _extract_socket_devices(devices)
+    if socket_devices:
+        discovered["smart_socket_devices"] = socket_devices
+        log.info(f"[AUTODISCOVERY] Smart socket trovate: {len(socket_devices)}")
     if controls:
         discovered["controls"] = controls
     _save_cache(discovered, platform)
     _apply_discovered(discovered)
     log.info("[AUTODISCOVERY] Discovery completata.")
-

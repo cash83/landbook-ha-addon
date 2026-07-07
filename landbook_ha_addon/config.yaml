@@ -1,7 +1,7 @@
 name: Landbook LAN MQTT Bridge
-version: "0.6.19"
+version: "0.9.23"
 slug: landbook_lan_mqtt_bridge
-description: "Landbook LAN bridge TSL-first. Inserisci email, password e app: LAN key e schema TSL vengono scoperti automaticamente."
+description: "Landbook/Wonderfree LAN bridge: powerstation LAN con smart socket Wonderfree in HA."
 url: "https://github.com/cash83/landbook-ha-addon"
 arch:
   - aarch64
@@ -12,6 +12,8 @@ arch:
 startup: services
 boot: auto
 init: false
+map:
+  - share:rw
 host_network: true
 services:
   - mqtt:need
@@ -20,15 +22,17 @@ options:
   wf_password: ""
   app: "landbook"
   device_key: ""
-  device_host: "192.168.1.65"
+  device_host: ""
   device_port: 6607
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_user: ""
   mqtt_password: ""
   battery_capacity_wh: 2048
+  smart_sockets_enabled: true
+  smart_socket_poll_interval: 300
+  freeze_detection_enabled: true
   log_level: "info"
-  use_ttlv_walker: false
 schema:
   wf_email: str
   wf_password: password
@@ -41,5 +45,7 @@ schema:
   mqtt_user: str?
   mqtt_password: password?
   battery_capacity_wh: int
+  smart_sockets_enabled: bool
+  smart_socket_poll_interval: int
+  freeze_detection_enabled: bool
   log_level: list(debug|info|warning|error)
-  use_ttlv_walker: bool?

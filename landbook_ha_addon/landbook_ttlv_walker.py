@@ -1,6 +1,6 @@
-"""Generic TTLV walker driven by the TSL schema dumped to /data/landbook_tsl.json.
+﻿"""Generic TTLV walker driven by the TSL schema dumped to /data/landbook_tsl.json.
 
-The Landbook FPPT-T2400 firmware reports telemetry inside the encrypted bus payload
+The Landbook Wonderfree/Landbook powerstation firmware reports telemetry inside the encrypted bus payload
 using the same TTLV encoding it accepts for commands:
 
     tag  (2 bytes big-endian) = (id << 3) | type
@@ -114,17 +114,23 @@ def _read_one(buf: bytes, pos: int, end: int) -> Optional[Tuple[int, int, Any, i
             return None
         prefix = buf[pos]
         pos += 1
-        vlen = prefix + 1
+        marker = prefix & 0x7F
+        # Most Landbook integers use len-1. The FPPT-T2400 firmware also emits
+        # 0x09 for 2-byte values in telemetry structs (for example battery
+        # voltage: 00 1A 09 02 07 -> 519 -> 51.9V).
+        vlen = 2 if marker == 0x09 else marker + 1
         if vlen > 8 or pos + vlen > end:
             return None
         val = int.from_bytes(buf[pos:pos + vlen], "big")
+        if prefix & 0x80:
+            val = -val
         return ident, typ, val, pos + vlen
     if typ == TYPE_STRUCT:
         if pos + 2 > end:
             return None
         count = int.from_bytes(buf[pos:pos + 2], "big")
         pos += 2
-        # Defensive cap: real structs in the FPPT-T2400 telemetry stay under ~32.
+        # Defensive cap: real structs in the Wonderfree/Landbook powerstation telemetry stay under ~32.
         if count > 64:
             return None
         children: list = []
@@ -212,6 +218,12 @@ def decode_payload(payload: bytes, schema: Optional[dict] = None) -> Dict[str, A
         ident, typ, val, new_pos = item
         entry = id_index.get(ident)
         if entry is None:
+            pos = new_pos
+            continue
+        # pack_data riguarda pacchi/moduli batteria aggiuntivi. Per il bridge
+        # generico usiamo come sorgente principale battery_data.remaining_time e
+        # ignoriamo pack_data per evitare duplicati/valori fuorvianti.
+        if str(entry.get("code") or "") == "pack_data":
             pos = new_pos
             continue
         if typ == TYPE_STRUCT and isinstance(val, list):

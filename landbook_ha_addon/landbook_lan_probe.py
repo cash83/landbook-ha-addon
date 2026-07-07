@@ -44,57 +44,131 @@ def encode_cmd(cmd: int, packet_id: int, payload: bytes = b"") -> bytes:
     return escape_frame(bytes(frame))
 
 
-def iter_frames(buf: bytes):
-    data = unescape_stream(buf)
+def _frame_dict(frame: bytes, body_len: int) -> dict:
+    calc = checksum(frame[5:])
+    return {
+        "raw": frame,
+        "len": body_len,
+        "checksum": frame[4],
+        "checksum_ok": calc == frame[4],
+        "packet_id": int.from_bytes(frame[5:7], "big"),
+        "cmd": int.from_bytes(frame[7:9], "big"),
+        "payload": frame[9:],
+    }
+
+
+def _read_escaped_frame(buf: bytes, start: int):
+    """Read one escaped LAN frame from *buf* starting at AA AA.
+
+    Returns (frame_dict_or_none, raw_end, incomplete). raw_end is an index in the
+    original escaped stream, so callers can safely keep only the unconsumed tail.
+    The older parser unescaped the whole buffer first; that was fine for viewing
+    frames, but the bridge could not know how many raw bytes had been consumed
+    and sometimes replayed the last complete frame after every recv().
+    """
+    out = bytearray()
+    i = start
+    expected_len = None
+    body_len = None
+    while i < len(buf):
+        out.append(buf[i])
+        if len(out) == 4:
+            body_len = int.from_bytes(out[2:4], "big")
+            if body_len < 5:
+                return None, start + 1, False
+            expected_len = 4 + body_len
+        if expected_len is not None and len(out) >= expected_len:
+            frame = bytes(out[:expected_len])
+            return _frame_dict(frame, body_len), i + 1, False
+
+        # Escape rule used by the APK after the AA AA header: when an in-frame
+        # byte 0xAA is followed by 0xAA or 0x55, the raw stream carries AA 55 XX.
+        # If AA 55 sits at the end of the current TCP chunk, keep the partial
+        # frame for the next recv() instead of treating 0x55 as real payload.
+        if len(out) > 2 and buf[i] == 0xAA and i + 1 < len(buf) and buf[i + 1] == 0x55:
+            if i + 2 >= len(buf):
+                return None, start, True
+            if buf[i + 2] in (0xAA, 0x55):
+                i += 1
+        i += 1
+    return None, start, True
+
+
+def extract_frames(buf: bytes):
+    """Return (frames, tail) from an escaped LAN stream.
+
+    *frames* are unescaped frame dictionaries, identical to iter_frames().
+    *tail* is the raw escaped suffix that was not consumed because it may contain
+    a partial frame/header. This is the safe API for long-running recv loops.
+    """
+    frames = []
     pos = 0
-    while True:
-        start = data.find(b"\xAA\xAA", pos)
-        if start < 0 or len(data) - start < 9:
-            break
-        body_len = int.from_bytes(data[start + 2 : start + 4], "big")
-        end = start + 4 + body_len
-        if end > len(data):
-            break
-        frame = data[start:end]
-        calc = checksum(frame[5:])
-        yield {
-            "raw": frame,
-            "len": body_len,
-            "checksum": frame[4],
-            "checksum_ok": calc == frame[4],
-            "packet_id": int.from_bytes(frame[5:7], "big"),
-            "cmd": int.from_bytes(frame[7:9], "big"),
-            "payload": frame[9:],
-        }
-        pos = end
+    while pos < len(buf):
+        start = buf.find(b"\xAA\xAA", pos)
+        if start < 0:
+            # Keep a single trailing AA: it may become the first byte of AA AA
+            # when the next TCP chunk arrives. Drop other noise to cap memory.
+            return frames, (b"\xAA" if buf.endswith(b"\xAA") else b"")
+        if len(buf) - start < 9:
+            return frames, buf[start:]
+        frame, raw_end, incomplete = _read_escaped_frame(buf, start)
+        if incomplete:
+            return frames, buf[start:]
+        if frame is None:
+            pos = raw_end
+            continue
+        frames.append(frame)
+        pos = raw_end
+    return frames, b""
+
+
+def iter_frames(buf: bytes):
+    frames, _tail = extract_frames(buf)
+    yield from frames
 
 
 def hexs(data: bytes) -> str:
     return data.hex(" ").upper()
 
 
-def recv_some(sock: socket.socket, seconds: float) -> bytes:
+def recv_some(sock: socket.socket, seconds: float, quiet_after_data: float = 0.12) -> bytes:
+    """Receive bytes for up to *seconds*, but return soon after data arrives.
+
+    The older helper always waited the full timeout even when the device had
+    already answered. During LAN login it was called twice with timeout=10,
+    so every reconnect appeared to take ~20s. For the bridge this made a
+    simple sensor-silence reconnect look like a long deep-sleep.
+
+    We still keep a small quiet window after the last byte so split TCP chunks
+    can be coalesced; incomplete LAN frames are preserved by extract_frames().
+    """
     sock.setblocking(False)
-    end = time.time() + seconds
+    end = time.time() + max(0.0, float(seconds))
     chunks = []
-    while time.time() < end:
-        try:
-            chunk = sock.recv(4096)
-            if chunk:
-                chunks.append(chunk)
-            else:
+    last_data = None
+    try:
+        while time.time() < end:
+            try:
+                chunk = sock.recv(4096)
+                if chunk:
+                    chunks.append(chunk)
+                    last_data = time.time()
+                    continue
                 break
-        except BlockingIOError:
-            time.sleep(0.05)
-        except socket.timeout:
-            break
-    sock.setblocking(True)
+            except BlockingIOError:
+                if last_data is not None and (time.time() - last_data) >= quiet_after_data:
+                    break
+                time.sleep(0.02)
+            except socket.timeout:
+                break
+    finally:
+        sock.setblocking(True)
     return b"".join(chunks)
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--host", default="192.168.1.65")
+    p.add_argument("--host", default="")
     p.add_argument("--port", type=int, default=6607)
     p.add_argument("--timeout", type=float, default=3.0)
     args = p.parse_args()

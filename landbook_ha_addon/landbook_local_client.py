@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import base64
 import hashlib
 import socket
@@ -84,7 +84,7 @@ def connect_and_login(host: str, port: int, key_b64: str, timeout: float):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="192.168.1.65")
+    parser.add_argument("--host", default="")
     parser.add_argument("--port", type=int, default=6607)
     parser.add_argument("--key", required=True, help="LAN key (base64). Must be retrieved from the cloud and persisted by the addon.")
     parser.add_argument("--timeout", type=float, default=5)

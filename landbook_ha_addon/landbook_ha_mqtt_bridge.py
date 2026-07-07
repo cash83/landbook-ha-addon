@@ -1,9 +1,9 @@
-﻿"""
-Landbook FPPT-T2400 — LAN to Home Assistant MQTT bridge  v0.3.79-fixed
+"""
+Landbook/Wonderfree generic TSL-driven LAN to Home Assistant MQTT bridge.
 
-Design: connect → subscribe(10s) → bus_mask(8s) → bus_refresh(20s) → recv loop → reconnect on silence/error
-Report subscription renewed every 60s (device forgets it after ~60s).
-MQTT alert after consecutive sensor-silence reconnects, including fully mute sessions.
+Design: cloud provisioning caches LAN key and TSL; runtime connects over LAN,
+subscribes once, sends a top-level TSL bus_mask plus bus_refresh every 10s,
+decodes frames, and reconnects on silence or network errors.
 """
 
 import argparse
@@ -13,11 +13,11 @@ import json
 import os
 import socket
 import sys
-import threading
 import time
-from typing import Any
+import urllib.parse
+import urllib.request
 
-from landbook_lan_probe import encode_cmd, hexs, iter_frames, recv_some
+from landbook_lan_probe import encode_cmd, extract_frames, recv_some
 from landbook_local_client import aes_decrypt, aes_encrypt, connect_and_login, ttlv_number
 
 
@@ -33,20 +33,21 @@ def _dprint(*args, **kwargs):
 # ── Timing ───────────────────────────────────────────────────────────────────
 HEARTBEAT_INTERVAL     = 10    # LAN keepalive (seconds)
 MQTT_PING_INTERVAL     = 30    # MQTT keepalive
-FRAME_SILENCE_TIMEOUT  = 30    # come 0.2.7 veloce: tollera il ciclo bus_mask
-SENSOR_RECONNECT_AFTER      = 30  # dopo ~30s senza sensori: evento/riconnessione per automazioni HA
-SENSOR_SILENCE_TIMEOUT = SENSOR_RECONNECT_AFTER
+FRAME_SILENCE_TIMEOUT  = 30    # tollera il ciclo bus_mask
+SENSOR_RECONNECT_AFTER      = 50  # dopo ~50s senza sensori: evento/riconnessione per automazioni HA
+                                   # (alzato da 30s: il device cicla naturalmente Low/LAN+WiFi reporting
+                                   # ogni ~28-30s, e una soglia troppo vicina scambiava quel ciclo normale
+                                   # per un freeze, causando reconnect inutili)
+BUS_REFRESH_MIN_GAP    = 5     # debounce: non rimandare bus_mask/bus_refresh se già inviati da meno di Ns
 SENSOR_SILENCE_RESTART = 180  # dopo 3 min senza sensori: riavvio processo
-STARTUP_PRIMER_SUBSCRIBE_AFTER = 12  # sessione nata muta: ritenta presto la subscription
-STARTUP_PRIMER_MASK_AFTER      = 25  # sessione nata muta: richiedi solo i dati batteria/base
-REPORT_RESUBSCRIBE     = 120   # come 0.2.7 veloce: subscription rara
-BUS_MASK_INTERVAL      = 8     # logica veloce: full mask + refresh ogni 8s
+REPORT_RESUBSCRIBE     = 120   # subscription rara
+BUS_MASK_INTERVAL      = 10    # simple LAN: bus_mask + bus_refresh fissi ogni ~10s
 RECONNECT_DELAY_INIT   = 2.0   # recovery LAN rapido dopo freeze/unreachable
 RECONNECT_DELAY_MAX    = 5.0   # non aspettare 17/25/30s tra retry
 UNREACHABLE_RESTART    = 180   # restart process after 3 min unreachable
 UNREACHABLE_WIFI_FROZEN_ALERT = 30  # dopo ~30s LAN irraggiungibile: alert wifi_frozen
+UNREACHABLE_STOP_AFTER = 2          # dopo 2 alert LAN irraggiungibile consecutivi: ferma l'add-on (vincolato comunque a MIN_SECONDS_BEFORE_STOP)
 BROKEN_PIPE_RESTART    = 30    # restart process after 30s broken-pipe loop
-FAULT_RECOVERY_MAX     = 3     # max retrigger E02 per sessione (evita loop)
 AVAILABILITY_HOLD      = 300   # hold MQTT "online" for 5 min during outage
 COMMAND_DUPLICATE_WINDOW = 0.8 # drop same command repeated by HA/UI immediately
 COMMAND_OPPOSITE_WINDOW  = 2.5 # drop fast ON/OFF or select A/B bounces
@@ -57,7 +58,13 @@ GRID_OPPOSITE_WINDOW     = 3.0 # grid/micro-inverter is the most fragile command
 # Dopo WIFI_FROZEN_ALERT_AFTER: pubblica evento MQTT per automazioni HA.
 WIFI_FROZEN_ALERT_AFTER  = 1     # evento MQTT al primo freeze rilevato
 WIFI_FROZEN_ALERT_COOLDOWN = 50  # consenti un nuovo alert dopo ~50s se il freeze persiste
-
+WIFI_FROZEN_STOP_AFTER = 2          # dopo 2 freeze consecutivi: ferma l'add-on (vincolato comunque a MIN_SECONDS_BEFORE_STOP)
+MQTT_RECONNECT_COOLDOWN = 20   # tra un reconnect MQTT e il successivo, se il precedente è fallito
+# L'automazione HA che riavvia il WiFi del router, attivata dal primo alert
+# wifi_frozen, spegne il WiFi e lo riaccende dopo ~20s. L'addon non deve
+# spegnersi PRIMA che quel ciclo sia completato, altrimenti muore proprio
+# mentre la rete sta per tornare e non c'è più nessuno a riconnettersi.
+MIN_SECONDS_BEFORE_STOP = 35   # margine sopra i 20s del router prima di fermare l'add-on
 
 # ── Device identity ──────────────────────────────────────────────────────────
 DEVICE_KEY   = "000000000000"
@@ -80,20 +87,163 @@ def _read_app_version() -> str:
 
 APP_VERSION  = _read_app_version()
 DISCOVERY_CACHE_PATH = "/data/discovered.json"
+PLATFORMS_PATH = "/app/platforms.json"
+SMART_SOCKET_PRODUCT_KEYS = {"p11spk"}
+SMART_SOCKET_SENSOR_DEFS = {
+    "power": ("Power", "W", "power", "measurement"),
+    "voltage": ("Voltage", "V", "voltage", "measurement"),
+    "current": ("Current", "A", "current", "measurement"),
+    "apparent_power": ("Apparent Power", "VA", "apparent_power", "measurement"),
+    "power_factor": ("Power Factor", None, "power_factor", "measurement"),
+    "energy": ("Energy", "kWh", "energy", "total_increasing"),
+}
+SMART_SOCKET_ON_HEX = "aa aa 00 07 21 00 05 00 13 00 09"
+SMART_SOCKET_OFF_HEX = "aa aa 00 07 21 00 05 00 13 00 08"
+# Poll consecutivi in cui una presa è assente dalla device-list cloud prima di
+# rimuoverla da Home Assistant (eliminata dall'app).
+SMART_SOCKET_NOT_FOUND_LIMIT = 3
+SMART_SOCKET_FALLBACK_DEVICES = (
+    {
+        "device_key": "00D6CBEDD001",
+        "product_key": "p11sPk",
+        "name": "SPP 16A2_D001",
+        "product_name": "Smart socket",
+    },
+    {
+        "device_key": "00D6CBEDCFA7",
+        "product_key": "p11sPk",
+        "name": "Presa Ha",
+        "product_name": "Smart socket",
+    },
+)
+INTELLIGENT_CHARGING_POWER_ID = "intelligent_charging_power"
+INTELLIGENT_CHARGING_WATTS = (200, 400, 600, 800)
+TIMED_CHARGE_CONNECTION_TAG = 0x004C  # id 9, compact STRUCT/ARRAY encoding
 OUTPUT_POWER_TAG = 0x00EA
 BUS_REFRESH_TAG  = 0x009A
-BUS_MASK_IDS = [
-    0x001E, 0x0027, 0x0021, 0x001C, 0x0020, 0x0026, 0x0022, 0x001F,
-    0x000B, 0x001D, 0x0010, 0x0011, 0x000D, 0x000A, 0x0005,
-    0x0008, 0x0009, 0x0003, 0x0006, 0x0002, 0x001B, 0x0001,
-    0x000F, 0x000C, 0x000E, 0x0004, 0x0012, 0x0029, 0x002A,
-]
+# Runtime bus_mask is generated only from the discovered TSL.
+# Legacy fallback was removed because on this powerstation it caused an endless
+# TSL→legacy loop with only pv_data:0 frames.
+_BUS_MASK_CACHE = None
+_BUS_MASK_SOURCE = ""
+_BUS_MASK_EXCLUDED_IDS = {7, 18}
+_BUS_MASK_EXCLUDED_CODES = {"device_type", "measure_data"}
+
+
+def _read_tsl_bundle_for_bus_mask():
+    """Read the current model TSL cache written at bootstrap."""
+    for path in ("/data/landbook_tsl.json", "/share/landbook_tsl.json", "/data/discovered.json"):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def _iter_tsl_items(container):
+    if isinstance(container, dict):
+        for code, info in container.items():
+            if isinstance(info, dict):
+                yield str(code), info
+    elif isinstance(container, list):
+        for item in container:
+            if isinstance(item, dict):
+                code = item.get("code") or item.get("identifier") or item.get("identifierName") or item.get("name")
+                yield str(code or ""), item
+
+
+def _top_level_tsl_id(info):
+    if not isinstance(info, dict):
+        return None
+    ident = info.get("id", info.get("abId", info.get("abid")))
+    if ident is None:
+        for key in ("resourceId", "attributeId", "attrId", "paramId"):
+            ident = info.get(key)
+            if ident is not None:
+                break
+    try:
+        ident = int(ident)
+    except Exception:
+        return None
+    if 0 < ident <= 0xFFFF:
+        return ident
+    return None
+
+
+def _dedupe_ids(ids):
+    deduped = []
+    seen = set()
+    for ident in ids:
+        try:
+            ident = int(ident)
+        except Exception:
+            continue
+        if ident <= 0 or ident > 0xFFFF or ident in seen:
+            continue
+        seen.add(ident)
+        deduped.append(ident)
+    return sorted(deduped)
+
+
+def _ids_from_full_tsl(bundle):
+    ids = []
+    for section in ("properties", "controls", "tsl_controls"):
+        for code, info in _iter_tsl_items(bundle.get(section)):
+            if not code or not isinstance(info, dict):
+                continue
+            kind = str(info.get("kind") or info.get("accessMode") or info.get("rwFlag") or "").lower()
+            t = str(info.get("type") or info.get("dataType") or info.get("valueType") or "").upper()
+            if t in ("EVENT", "FUNCTION") and "property" not in kind:
+                continue
+            # bus_mask uses top-level property/resource IDs only. Struct children
+            # reuse small field IDs that collide with top-level IDs; including
+            # them can request unrelated properties.
+            ident = _top_level_tsl_id(info)
+            if ident in _BUS_MASK_EXCLUDED_IDS or code in _BUS_MASK_EXCLUDED_CODES:
+                continue
+            if ident is not None:
+                ids.append(ident)
+    return _dedupe_ids(ids)
+
+
+def _bus_mask_ids_from_tsl():
+    global _BUS_MASK_SOURCE
+    bundle = _read_tsl_bundle_for_bus_mask()
+    ids = _ids_from_full_tsl(bundle)
+    source = "full-tsl-business"
+    _BUS_MASK_SOURCE = source if ids else ""
+    if ids and _is_debug():
+        print(f"[BUS-MASK] source={source} ids={ids}", flush=True)
+    return ids
+
+
+def resolve_bus_mask_ids(args=None):
+    """Return top-level IDs from the cached product TSL."""
+    global _BUS_MASK_CACHE
+    if _BUS_MASK_CACHE is None:
+        ids = _bus_mask_ids_from_tsl()
+        if not ids:
+            raise RuntimeError("TSL bus mask unavailable: /data/landbook_tsl.json missing or empty")
+        _BUS_MASK_CACHE = ids
+        src = f" source={_BUS_MASK_SOURCE}" if _BUS_MASK_SOURCE else ""
+        print(f"[BUS-MASK] TSL business: {len(ids)} ids{src}", flush=True)
+    return list(_BUS_MASK_CACHE)
 
 
 # ── Switch / mode tables ─────────────────────────────────────────────────────
 SWITCH_HEX = {}  # populated from TSL BOOL controls at startup
 
-MODE_VALUE_BY_LABEL = {}
+# Codes the firmware reports inconsistently between the full "work_profile"
+# frame and shorter battery-only frames in the same polling cycle (observed:
+# led_status_set reads True in the work_profile frame right after a command,
+# False in the battery-only frame a moment later). For these, only trust the
+# value when it comes from a work_profile frame — otherwise the walker-driven
+# switch/select publish below is skipped for that code on that frame.
+FRAME_COHERENCE_REQUIRES_WORK_PROFILE = {"led_status_set"}
+
 MODE_LABEL_BY_VAL = {}
 
 AC_STATE_WORDS   = {0x0070: "OFF", 0x0071: "ON"}
@@ -111,7 +261,7 @@ DEVICE_STATUS_LABELS = {
 # Il profilo HMI/work_profile contiene campi interni che possono sembrare
 # codici errore ma non sempre lo sono: osservato field[3]=40 mentre l'app
 # ufficiale mostrava solo "Carica scarica" e nessun fault. Per HA pubblichiamo
-# come fault solo i codici presenti nel TSL ufficiale del T2400.
+# come fault solo codici noti/riconosciuti; altri valori restano raw se non mappati.
 OFFICIAL_FAULT_CODES = {
     0, 1, 2, 3, 4, 7, 8, 9, 10, 11, 12, 13, 14,
     101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
@@ -150,7 +300,35 @@ VALUE_STATES = {
 LEGACY_COMMAND_STATE_CLEANUP = {"led", "screen", "high_frequency_reporting", "smart_socket_mode"}
 
 SWITCH_DISCOVERY_META = {}
-NON_CACHED_SWITCH_IDS = set(SWITCH_HEX.keys()) | {"mode"}
+
+
+def _first_existing_switch_id(*candidates):
+    for command_id in candidates:
+        if command_id in SWITCH_HEX:
+            return command_id
+    return None
+
+
+def _grid_command_id():
+    return _first_existing_switch_id("grid_power_switch_set", "grid")
+
+
+def _dc_command_id():
+    return _first_existing_switch_id("dc_switch", "dc")
+
+
+def _ac_command_id():
+    return _first_existing_switch_id("ac_switch", "ac")
+
+
+def _canonical_command_id(command_id):
+    if command_id == "grid":
+        return _grid_command_id() or command_id
+    if command_id == "dc":
+        return _dc_command_id() or command_id
+    if command_id == "ac":
+        return _ac_command_id() or command_id
+    return command_id
 
 
 # ── Sensor definitions ───────────────────────────────────────────────────────
@@ -165,7 +343,6 @@ try:
         build_switch_hex_overlay as _build_switch_hex_overlay,
         build_sensor_defs_overlay as _build_sensor_defs_overlay,
         build_switch_meta_overlay as _build_switch_meta_overlay,
-        build_select_overlay     as _build_select_overlay_for_init,
     )
     _tsl_switch_overlay = _build_switch_hex_overlay(existing=SWITCH_HEX)
     _tsl_sensor_overlay = _build_sensor_defs_overlay(existing=SENSOR_DEFS)
@@ -202,7 +379,6 @@ FIRMWARE_SENSOR_IDS = {"firmware_version_set", "firmware_version_bms", "firmware
 BMS_CELL_SENSOR_IDS = {f"battery_cell_{c:02d}_voltage" for c in range(1, 14)}
 BMS_INFO_SENSOR_IDS = BMS_CELL_SENSOR_IDS | {"battery_cycles", "bms_allow_max_charge_current", "bms_mos_status"}
 BATTERY_INFO_SENSOR_IDS = {"battery_percentage", "battery_voltage", "battery_temp", "battery_remaining_wh", "remaining_time_minutes"}
-BATTERY_CACHE_KEYS = BATTERY_INFO_SENSOR_IDS | {"_battery_soc_estimate_wh", "_battery_soc_estimate_ts"}
 EXPIRING_SENSOR_IDS = BATTERY_INFO_SENSOR_IDS | BMS_INFO_SENSOR_IDS | {
     "battery_current", "battery_total_power",
     "device_status", "fault_code", "fault_code_raw",
@@ -248,19 +424,33 @@ NON_MEANINGFUL_SENSOR_KEYS = {
 }
 
 
-def _has_meaningful_sensor_data(decoded: dict) -> bool:
+def _has_meaningful_sensor_data(decoded: dict, args=None) -> bool:
     if not decoded:
         return False
     for key in decoded:
         if key in NON_MEANINGFUL_SENSOR_KEYS:
             continue
+        if key in SWITCH_HEX:
+            continue
+        if args is not None:
+            if key in (getattr(args, "_tsl_select_catalog", {}) or {}):
+                continue
+            if key in (getattr(args, "_tsl_number_catalog", {}) or {}):
+                continue
+        try:
+            if key in globals().get("_NON_SENSOR_EXACT", set()):
+                continue
+            info = _load_tsl_controls().get(key) or {}
+            if info.get("writable"):
+                continue
+        except Exception:
+            pass
         return True
     return False
 
 # ── MQTT discovery: object_id identici all'integrazione custom ────────────────
 DEVICE_OBJECT_ID = "landbook"
 
-SENSOR_OBJECT_ID_OVERRIDES = {}
 SWITCH_OBJECT_ID_OVERRIDES = {}
 _DIAGNOSTIC_SENSOR_IDS = set()
 _DIAGNOSTIC_PREFIXES = ()
@@ -306,15 +496,6 @@ def _tag_prefixed_s16(blob: bytes, tag: bytes):
     return None if i < 0 else _s16_prefixed(blob, i + 2)
 
 
-def _tag_battery_power(blob: bytes, tag: bytes):
-    i = blob.find(tag)
-    if i < 0 or i + 5 > len(blob):
-        return None
-    raw = blob[i + 2:i + 5]
-    if raw[2] == 0 and raw[0] in (0x00, 0x80):
-        return -raw[1] if raw[0] & 0x80 else raw[1]
-    return _s16_prefixed(blob, i + 2)
-
 
 def _tag_battery_power_after(blob: bytes, tag: bytes, after_tag: bytes):
     after = blob.find(after_tag)
@@ -328,9 +509,90 @@ def _tag_battery_power_after(blob: bytes, tag: bytes, after_tag: bytes):
     return _s16_prefixed(blob, i + 2)
 
 
-def _marker_u16(blob: bytes, marker: bytes):
-    i = blob.find(marker)
-    return None if i < 0 else _u16(blob, i + len(marker))
+def _read_compact_ttlv_int(data: bytes, pos: int, end: int):
+    """Read the compact integer encoding used inside Landbook telemetry structs."""
+    if pos >= end:
+        return None, pos
+    prefix = data[pos]
+    marker = prefix & 0x7F
+    # Most fields use len-1. This firmware also emits 0x09 for 2-byte values
+    # such as battery voltage (observed: 00 1A 09 02 07 -> 519 -> 51.9V).
+    vlen = 2 if marker == 0x09 else marker + 1
+    if vlen < 1 or vlen > 8 or pos + 1 + vlen > end:
+        return None, pos
+    value = int.from_bytes(data[pos + 1:pos + 1 + vlen], "big", signed=False)
+    if prefix & 0x80:
+        value = -value
+    return value, pos + 1 + vlen
+
+
+def _apply_battery_data_struct(payload: bytes, out: dict) -> bool:
+    """Decode top-level battery_data (id=3, tag 0x001c) from real LAN frames."""
+    search_from = 0
+    while True:
+        idx = payload.find(b"\x00\x1c", search_from)
+        if idx < 0:
+            return False
+        search_from = idx + 1
+        if idx + 4 > len(payload):
+            continue
+        count = _u16(payload, idx + 2)
+        if count is None or count <= 0 or count > 16:
+            continue
+        pos = idx + 4
+        values = {}
+        ok = True
+        for _ in range(count):
+            if pos + 3 > len(payload):
+                ok = False
+                break
+            tag = _u16(payload, pos)
+            pos += 2
+            typ = tag & 0x07
+            ident = tag >> 3
+            if typ != 0x02:
+                ok = False
+                break
+            value, new_pos = _read_compact_ttlv_int(payload, pos, len(payload))
+            if new_pos == pos:
+                ok = False
+                break
+            values[ident] = value
+            pos = new_pos
+        if not ok or len(values) < 3:
+            continue
+
+        soc = values.get(1)
+        remaining = values.get(2)
+        voltage_raw = values.get(3)
+        power = values.get(5)
+        temp = values.get(6)
+
+        changed = False
+        if _between(soc, 0, 100):
+            out["battery_percentage"] = int(soc)
+            changed = True
+        if _between(remaining, 0, 65534):
+            out["remaining_time_minutes"] = int(remaining)
+            changed = True
+        voltage = None
+        if _between(voltage_raw, 400, 700):
+            voltage = round(float(voltage_raw) / 10.0, 1)
+        elif _between(voltage_raw, 40, 70):
+            voltage = float(voltage_raw)
+        if voltage is not None:
+            out["battery_voltage"] = voltage
+            changed = True
+        if _between(power, -3000, 3000):
+            out["battery_total_power"] = int(power)
+            if voltage is not None and abs(float(voltage)) > 0:
+                out["battery_current"] = round(float(power) / float(voltage), 2)
+            changed = True
+        if _between(temp, -40, 120):
+            out["battery_temp"] = int(temp)
+            changed = True
+        return changed
+
 
 
 def _ascii(data: bytes):
@@ -378,21 +640,37 @@ def _extract_output_power_set(payload: bytes, out: dict) -> None:
 
 
 def _parse_work_profile(wp: str, out: dict) -> None:
-    # hmi_data_no = "device_status, uptime_min, flags, fault_code, ..."
-    # Confermato dal TSL cloud: field[0]=device_status, field[1]=uptime,
-    # field[3]=fault_code. output_power_set NON è in field[4]: il cloud può
-    # riportare 140W mentre hmi_data_no field[4] resta 0.
+    # hmi_data_no = "device_status, field1_unknown, field2_candidate_uptime, fault_code, ..."
+    #
+    # ATTENZIONE: field[1] era storicamente etichettato "uptime_minutes_lan", ma
+    # i dati raccolti (storico HA + TSL cloud) mostrano che NON si comporta come
+    # un uptime: lo stesso valore (es. 257) è tornato identico a distanza di
+    # 20+ minuti, e in altre sessioni è rimasto fisso per ore mentre field[2]
+    # cresceva di 1 ogni minuto. field[1] resta pubblicato per compatibilità/
+    # diagnostica ma sotto un nome neutro. field[2] è il candidato più plausibile
+    # per il vero uptime in minuti (cresce in modo monotono nei log osservati) —
+    # va trattato come ipotesi da confermare, non come dato certo.
     try:
         fields = wp.split(",")
         if len(fields) < 2:
             return
         status = int(fields[0])
-        uptime = int(fields[1])
+        field1_unknown = int(fields[1])
         if 0 <= status <= 15:
             out["device_status_raw"] = status
             out["device_status"] = DEVICE_STATUS_LABELS.get(status, f"Stato {status}")
-        if 0 <= uptime <= 100000:
-            out["uptime_minutes_lan"] = uptime
+        if 0 <= field1_unknown <= 100000:
+            out["hmi_field1_raw"] = field1_unknown
+            # Manteniamo anche il vecchio nome per non rompere automazioni/dashboard
+            # esistenti che lo referenziano, ma è deprecato: non è un uptime affidabile.
+            out["uptime_minutes_lan"] = field1_unknown
+        if len(fields) > 2:
+            try:
+                field2 = int(fields[2])
+                if 0 <= field2 <= 100000:
+                    out["hmi_field2_uptime_candidate"] = field2
+            except ValueError:
+                pass
         # field[3] puo' contenere anche stati HMI interni: accettalo come fault
         # solo se e' un codice presente nel TSL ufficiale.
         if len(fields) > 3:
@@ -693,6 +971,8 @@ def decode_bus_payload(plain: bytes) -> dict:
                     if abs(float(voltage)) > 0:
                         out["battery_current"] = round(power_pref / float(voltage), 2)
 
+    _apply_battery_data_struct(payload, out)
+
     if any(k in out for k in ("pv_input_power", "ac_input_power")):
         out["total_input_power"] = round(float(out.get("pv_input_power") or 0) + float(out.get("ac_input_power") or 0), 2)
     if any(k in out for k in ("grid_b_power", "ac_output_power", "dc_output_power")):
@@ -734,6 +1014,10 @@ def _mqtt_string(value):
     return len(data).to_bytes(2, "big") + data
 
 
+class MqttConnectionError(RuntimeError):
+    """Raised for MQTT socket failures so they are not handled as LAN errors."""
+
+
 class MqttClient:
     def __init__(self, host, port, username=None, password=None,
                  client_id="landbook_lan_bridge",
@@ -749,6 +1033,7 @@ class MqttClient:
         self.sock = None
         self.rx = bytearray()
         self.next_packet_id = 1
+        self._subscriptions = []
 
     def connect(self):
         self.sock = socket.create_connection((self.host, self.port), timeout=10)
@@ -778,17 +1063,73 @@ class MqttClient:
             payload = payload.encode("utf-8")
         variable = _mqtt_string(topic)
         header = bytes([0x31 if retain else 0x30])
-        self.sock.sendall(header + _mqtt_remaining_length(len(variable) + len(payload)) + variable + payload)
+        try:
+            if self.sock is None:
+                raise OSError("MQTT socket is closed")
+            self.sock.sendall(header + _mqtt_remaining_length(len(variable) + len(payload)) + variable + payload)
+        except OSError as exc:
+            raise MqttConnectionError(f"MQTT publish failed: {exc}") from exc
 
-    def subscribe(self, topics):
+    def reconnect(self):
+        """Chiude (se serve) e ricrea la connessione MQTT da zero."""
+        self._last_reconnect_attempt = time.time()
+        try:
+            if self.sock is not None:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+        self.connect()
+        if self._subscriptions:
+            self._send_subscribe(self._subscriptions)
+
+    def publish_resilient(self, topic, payload, retain=False):
+        """Come publish(), ma se il socket MQTT è morto (broken pipe, ecc.)
+        tenta di riconnettersi e ripubblicare prima di arrendersi.
+
+        Il primo tentativo di reconnect dopo un publish falito è sempre
+        immediato: un alert critico (es. wifi_frozen) deve poter riuscire già
+        al primo giro. Il cooldown si applica solo ai tentativi successivi,
+        per non sprecare handshake MQTT ripetuti quando il broker è giù da
+        più tempo (es. più alert consecutivi durante la stessa interruzione)."""
+        try:
+            self.publish(topic, payload, retain=retain)
+            return True
+        except Exception:
+            last_attempt = getattr(self, "_last_reconnect_attempt", 0.0)
+            if time.time() - last_attempt < MQTT_RECONNECT_COOLDOWN:
+                raise
+            self.reconnect()
+            self.publish(topic, payload, retain=retain)
+            return True
+
+    def _send_subscribe(self, topics):
         packet_id = self.next_packet_id
         self.next_packet_id += 1
         variable = packet_id.to_bytes(2, "big")
         payload = b"".join(_mqtt_string(t) + b"\x00" for t in topics)
-        self.sock.sendall(b"\x82" + _mqtt_remaining_length(len(variable) + len(payload)) + variable + payload)
+        try:
+            if self.sock is None:
+                raise OSError("MQTT socket is closed")
+            self.sock.sendall(b"\x82" + _mqtt_remaining_length(len(variable) + len(payload)) + variable + payload)
+        except OSError as exc:
+            raise MqttConnectionError(f"MQTT subscribe failed: {exc}") from exc
+
+    def subscribe(self, topics):
+        topics = list(dict.fromkeys(t for t in topics if t))
+        self._subscriptions = topics
+        if not topics:
+            return False
+        self._send_subscribe(topics)
+        return True
 
     def ping(self):
-        self.sock.sendall(b"\xC0\x00")
+        try:
+            if self.sock is None:
+                raise OSError("MQTT socket is closed")
+            self.sock.sendall(b"\xC0\x00")
+        except OSError as exc:
+            raise MqttConnectionError(f"MQTT ping failed: {exc}") from exc
 
     def disconnect(self):
         if self.sock is None:
@@ -803,6 +1144,8 @@ class MqttClient:
 
     def read_messages(self):
         try:
+            if self.sock is None:
+                raise RuntimeError("MQTT disconnected")
             chunk = self.sock.recv(4096)
             if chunk:
                 self.rx.extend(chunk)
@@ -810,6 +1153,8 @@ class MqttClient:
                 raise RuntimeError("MQTT disconnected")
         except BlockingIOError:
             pass
+        except (OSError, RuntimeError) as exc:
+            raise MqttConnectionError(f"MQTT disconnected: {exc}") from exc
         messages = []
         while True:
             if len(self.rx) < 2:
@@ -845,6 +1190,753 @@ class MqttClient:
 
 def _device_key(args):
     return str(getattr(args, "device_key", "") or DEVICE_KEY).strip()
+
+
+def _load_discovered_cache() -> dict:
+    try:
+        with open(DISCOVERY_CACHE_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_discovered_cache(data: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(DISCOVERY_CACHE_PATH), exist_ok=True)
+        with open(DISCOVERY_CACHE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+    except Exception as exc:
+        print(f"discovered cache write failed: {exc}", flush=True)
+
+
+def _socket_cloud():
+    """Return the cloud session manager for smart sockets, or None.
+
+    Isolated in wf_socket_cloud so the powerstation LAN path stays untouched:
+    this owns the cloud access-token refresh and the live device list.
+    """
+    try:
+        from wf_socket_cloud import get_cloud
+    except Exception as exc:
+        print(f"[socket-cloud] modulo non disponibile: {exc}", flush=True)
+        return None
+    return get_cloud()
+
+
+def _normalize_auth_header(token: str) -> str:
+    token = str(token or "").strip()
+    if not token:
+        return ""
+    return token if token.lower().startswith("bearer ") else f"Bearer {token}"
+
+
+def _cloud_base_url(discovered: dict) -> str:
+    base = str(discovered.get("base_url") or "").strip()
+    if base:
+        return base.rstrip("/")
+    platform = str(discovered.get("_platform") or "").strip()
+    for path in (PLATFORMS_PATH, os.path.join(os.path.dirname(__file__), "platforms.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                platforms = json.load(fh) or {}
+            cfg = platforms.get(platform) or {}
+            base = str(cfg.get("base_url") or "").strip()
+            if base:
+                return base.rstrip("/")
+        except Exception:
+            pass
+    return ""
+
+
+def _cloud_accel_url(discovered: dict) -> str:
+    accel_url = str(discovered.get("accel_url") or "").strip()
+    if accel_url:
+        return accel_url
+    platform = str(discovered.get("_platform") or "").strip()
+    for path in (PLATFORMS_PATH, os.path.join(os.path.dirname(__file__), "platforms.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                platforms = json.load(fh) or {}
+            cfg = platforms.get(platform) or {}
+            accel_url = str(cfg.get("accel_url") or "").strip()
+            if accel_url:
+                return accel_url
+        except Exception:
+            pass
+    return ""
+
+
+def _smart_socket_devices(args) -> list:
+    if not getattr(args, "smart_sockets_enabled", True):
+        return []
+    data = _load_discovered_cache()
+    devices = data.get("smart_socket_devices") or []
+    out = []
+
+    def add_socket(dk: str, pk: str, name: str = "", product_name: str = "Smart socket"):
+        dk = str(dk or "").strip()
+        pk = str(pk or "").strip()
+        if not dk or pk.lower() not in SMART_SOCKET_PRODUCT_KEYS:
+            return
+        if any(existing["device_key"] == dk for existing in out):
+            return
+        out.append({
+            "device_key": dk,
+            "product_key": pk,
+            "name": str(name or dk),
+            "product_name": str(product_name or "Smart socket"),
+        })
+
+    for dev in devices:
+        if not isinstance(dev, dict):
+            continue
+        pk = str(dev.get("product_key") or dev.get("productKey") or "").strip()
+        dk = str(dev.get("device_key") or dev.get("deviceKey") or "").strip()
+        add_socket(
+            dk,
+            pk,
+            str(dev.get("name") or dev.get("deviceName") or dk),
+            str(dev.get("product_name") or dev.get("productName") or "Smart socket"),
+        )
+    # La lista auto-rilevata dal cloud (smart_socket_devices in cache) è
+    # autoritativa: le prese vengono scoperte da sole e, se eliminate dall'app,
+    # spariscono. Le chiavi statiche in config e i fallback interni servono solo
+    # come rete di sicurezza quando il cloud non ha ancora popolato la cache
+    # (primo avvio offline / credenziali assenti) — altrimenti riaggiungerebbero
+    # una presa appena rimossa.
+    if not out:
+        for idx in (1, 2):
+            add_socket(
+                getattr(args, f"smart_socket_{idx}_device_key", ""),
+                getattr(args, f"smart_socket_{idx}_product_key", ""),
+                getattr(args, f"smart_socket_{idx}_name", ""),
+            )
+        for dev in SMART_SOCKET_FALLBACK_DEVICES:
+            add_socket(
+                dev.get("device_key", ""),
+                dev.get("product_key", ""),
+                dev.get("name", ""),
+                dev.get("product_name", "Smart socket"),
+            )
+    return out
+
+
+def _smart_socket_device_by_key(args, device_key: str):
+    wanted = str(device_key or "").strip()
+    for dev in _smart_socket_devices(args):
+        if dev["device_key"] == wanted:
+            return dev
+    return None
+
+
+def _smart_socket_bus_topics(socket_dev: dict) -> list:
+    pk = socket_dev["product_key"]
+    dk = socket_dev["device_key"]
+    return [
+        f"q/1/d/qd{pk}{dk}/bus",
+        f"q/2/d/qd{pk}{dk}/bus",
+        f"q/1/d/qd/{pk}/{dk}/bus",
+        f"q/2/d/qd/{pk}/{dk}/bus",
+    ]
+
+
+def _smart_socket_frame(args, device_key: str, on: bool) -> bytes:
+    raw = SMART_SOCKET_ON_HEX if on else SMART_SOCKET_OFF_HEX
+    frame = bytearray(bytes.fromhex(raw.replace(" ", "")))
+    seqs = getattr(args, "_smart_socket_seq", None)
+    if not isinstance(seqs, dict):
+        seqs = {}
+    seq = int(seqs.get(device_key, int(time.time() * 1000) & 0xFF))
+    seq = (seq + 1) & 0xFF
+    seqs[device_key] = seq
+    args._smart_socket_seq = seqs
+    if len(frame) >= 7:
+        frame[6] = seq
+    return bytes(frame)
+
+
+def _publish_smart_socket_cloud_command(socket_dev: dict, payload: bytes, discovered: dict) -> None:
+    token = str(discovered.get("token") or "").strip()
+    accel_url = _cloud_accel_url(discovered)
+    accel_client = str(discovered.get("accel_client") or "").strip()
+    if not token or not accel_url:
+        raise RuntimeError("token o accel_url mancanti per comando smart socket")
+    parsed = urllib.parse.urlparse(accel_url)
+    if parsed.scheme not in ("ws", "wss"):
+        raise RuntimeError(f"accel_url non valido: {accel_url}")
+
+    try:
+        import paho.mqtt.client as paho_mqtt
+    except Exception as exc:
+        raise RuntimeError("py3-paho-mqtt non installato") from exc
+
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+    path = parsed.path or "/ws/v2"
+    prefix = accel_client if accel_client else "qu_landbook_"
+    if not prefix.endswith("_"):
+        prefix += "_"
+    client_id = f"{prefix}{int(time.time() * 1000)}"
+
+    cli = paho_mqtt.Client(client_id=client_id, transport="websockets", protocol=paho_mqtt.MQTTv311)
+    cli.username_pw_set(username="", password=_normalize_auth_header(token))
+    cli.ws_set_options(path=path)
+    if parsed.scheme == "wss":
+        cli.tls_set()
+    cli.connect(host, port, keepalive=25)
+    cli.loop_start()
+    try:
+        for topic in _smart_socket_bus_topics(socket_dev):
+            info = cli.publish(topic, payload=payload, qos=1, retain=False)
+            info.wait_for_publish(timeout=5)
+            if info.rc != paho_mqtt.MQTT_ERR_SUCCESS:
+                raise RuntimeError(f"publish cloud fallito rc={info.rc} topic={topic}")
+    finally:
+        cli.loop_stop()
+        cli.disconnect()
+
+
+def _handle_smart_socket_command(topic, payload, mqtt, base_topic, args) -> bool:
+    prefix = f"{base_topic}/smart_sockets/"
+    suffix = "/set/switch"
+    if not topic.startswith(prefix) or not topic.endswith(suffix):
+        return False
+    dk = topic[len(prefix):-len(suffix)]
+    socket_dev = _smart_socket_device_by_key(args, dk)
+    if not socket_dev:
+        print(f"smart socket command ignored: unknown device {dk}", flush=True)
+        return True
+    state = payload.strip().upper()
+    if state not in ("ON", "OFF"):
+        return True
+    if not _command_tx_allowed(args, f"smart_socket_{dk}", state, opposite_window=0.5):
+        return True
+    frame = _smart_socket_frame(args, dk, state == "ON")
+    discovered = _load_discovered_cache()
+    # Usa un token cloud fresco anche per il comando (altrimenti dopo la scadenza
+    # lo switch smetterebbe di rispondere, come i sensori).
+    cloud = _socket_cloud()
+    if cloud is not None and cloud.available():
+        try:
+            fresh = cloud.ensure_token()
+            if fresh:
+                discovered["token"] = fresh
+        except Exception as exc:
+            print(f"smart socket token refresh failed {dk}: {exc}", flush=True)
+    try:
+        _publish_smart_socket_cloud_command(socket_dev, frame, discovered)
+    except Exception as exc:
+        print(f"smart socket command failed {dk}: {exc}", flush=True)
+        return True
+    mqtt.publish(f"{base_topic}/smart_sockets/{dk}/switch", state, retain=True)
+    print(f"sent smart socket {dk} {state}", flush=True)
+    return True
+
+
+def _request_json(url: str, params: dict, token: str) -> dict:
+    query = urllib.parse.urlencode(params)
+    full_url = url + ("?" + query if query else "")
+    req = urllib.request.Request(
+        full_url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": _normalize_auth_header(token),
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _fetch_socket_attrs(discovered: dict, socket_dev: dict) -> dict:
+    base_url = _cloud_base_url(discovered)
+    token = str(discovered.get("token") or "").strip()
+    if not base_url or not token:
+        return {}
+    j = _request_json(
+        base_url + "/v2/binding/enduserapi/getDeviceBusinessAttributes",
+        {"dk": socket_dev["device_key"], "pk": socket_dev["product_key"]},
+        token,
+    )
+    if j.get("code") != 200:
+        return {}
+    data = j.get("data") or {}
+    attrs = data.get("customizeTslInfo") or []
+    out = {}
+    for item in attrs:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("resourceCode") or "")
+        value = item.get("resourceValce")
+        if code == "switch":
+            out["switch"] = "ON" if _boolish(value) else "OFF"
+        elif code == "electricity_data":
+            try:
+                out["energy"] = round(float(value) / 1000.0, 3)
+            except (TypeError, ValueError):
+                pass
+        elif code == "measure_data":
+            try:
+                measure = json.loads(value) if isinstance(value, str) else (value or {})
+            except Exception:
+                measure = {}
+            try:
+                voltage = round(float(measure.get("voltage_values") or 0) / 1000.0, 3)
+                out["voltage"] = voltage
+            except (TypeError, ValueError):
+                voltage = None
+                pass
+            try:
+                power = round(float(measure.get("power_value") or 0) / 1000.0, 3)
+                out["power"] = power
+            except (TypeError, ValueError):
+                power = None
+                pass
+            try:
+                current = round(float(measure.get("current_value") or 0) / 1000.0, 3)
+                out["current"] = current
+            except (TypeError, ValueError):
+                current = None
+                pass
+            if voltage is not None and current is not None:
+                apparent = round(float(voltage) * float(current), 3)
+                out["apparent_power"] = apparent
+                if apparent > 1 and power is not None:
+                    out["power_factor"] = round(float(power) / apparent, 3)
+                else:
+                    out["power_factor"] = 0
+    return out
+
+
+def _fetch_socket_online_status(discovered: dict) -> dict | None:
+    base_url = _cloud_base_url(discovered)
+    token = str(discovered.get("token") or "").strip()
+    if not base_url or not token:
+        return None
+    try:
+        j = _request_json(
+            base_url + "/v2/binding/enduserapi/userDeviceList",
+            {"pageSize": 50, "isAssociated": 1},
+            token,
+        )
+    except Exception as exc:
+        _dprint(f"smart socket online status failed: {exc}", flush=True)
+        return None
+    if j.get("code") != 200:
+        return None
+    items = (j.get("data") or {}).get("list") or []
+    out = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        dk = str(item.get("deviceKey") or item.get("device_key") or "").strip()
+        if not dk:
+            continue
+        try:
+            out[dk] = int(item.get("onlineStatus", 0) or 0) == 1
+        except Exception:
+            out[dk] = _boolish(item.get("onlineStatus"))
+    return out
+
+
+def _socket_liveness_topic(base_topic: str) -> str:
+    """Topic di 'bridge vivo' DEDICATO alle prese, del tutto separato dalla
+    availability della powerstation. Ha il proprio Last Will (vedi
+    _start_socket_liveness): va offline solo quando il processo add-on si spegne,
+    NON quando la powerstation ha problemi LAN/freeze."""
+    return f"{base_topic}/smart_sockets/bridge_availability"
+
+
+def _start_socket_liveness(args):
+    """Connessione MQTT SEPARATA, dedicata solo alle prese, il cui unico scopo è
+    tenere un Last Will sul topic di liveness delle prese.
+
+    È del tutto indipendente dalla connessione/availability della powerstation:
+    quando il processo add-on muore (stop o crash), il broker pubblica da solo
+    'offline' su questo topic → le prese diventano non disponibili in HA. Un
+    problema LAN/freeze della powerstation non passa da qui, quindi non tocca le
+    prese. Ritorna il client (da tenere referenziato) o None."""
+    if not getattr(args, "smart_sockets_enabled", True):
+        return None
+    try:
+        import paho.mqtt.client as paho_mqtt
+    except Exception as exc:
+        print(f"[socket-cloud] liveness non attiva (paho assente): {exc}", flush=True)
+        return None
+    topic = _socket_liveness_topic(args.topic)
+    cli = paho_mqtt.Client(
+        client_id=f"landbook_sock_live_{int(time.time() * 1000)}",
+        protocol=paho_mqtt.MQTTv311,
+    )
+    if getattr(args, "mqtt_user", ""):
+        cli.username_pw_set(args.mqtt_user, getattr(args, "mqtt_password", "") or "")
+    cli.will_set(topic, "offline", qos=1, retain=True)
+
+    def _on_connect(client, userdata, flags, rc, *a):
+        # Ripubblica 'online' a ogni (ri)connessione della connessione dedicata.
+        client.publish(topic, "online", qos=1, retain=True)
+
+    cli.on_connect = _on_connect
+    try:
+        cli.reconnect_delay_set(min_delay=1, max_delay=30)
+    except Exception:
+        pass
+    try:
+        cli.connect(args.mqtt_host, int(args.mqtt_port), keepalive=30)
+    except Exception as exc:
+        print(f"[socket-cloud] liveness connect fallita: {exc}", flush=True)
+        return None
+    cli.loop_start()
+    print(f"[socket-cloud] liveness prese attiva su {topic}", flush=True)
+    return cli
+
+
+def _stop_socket_liveness(args) -> None:
+    """Chiude in modo PULITO la connessione liveness prese (DISCONNECT esplicito,
+    niente Will) mantenendo il retained 'online'. Da chiamare prima di un
+    os.execv, così un self-restart del bridge (es. freeze powerstation) NON manda
+    le prese offline."""
+    cli = getattr(args, "_socket_liveness", None)
+    if cli is None:
+        return
+    args._socket_liveness = None
+    try:
+        cli.publish(_socket_liveness_topic(args.topic), "online", qos=1, retain=True)
+    except Exception:
+        pass
+    try:
+        cli.disconnect()   # DISCONNECT pulito → il broker NON pubblica il Will
+    except Exception:
+        pass
+    try:
+        cli.loop_stop()
+    except Exception:
+        pass
+
+
+def _restart_process(args) -> None:
+    """Self-restart del bridge preservando lo stato 'online' delle prese."""
+    _stop_socket_liveness(args)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def _publish_smart_socket_discovery(mqtt, base_topic, args):
+    parent_key = _device_key(args)
+    socket_liveness_topic = _socket_liveness_topic(base_topic)
+    socket_devices = _smart_socket_devices(args)
+    total_device = {
+        "identifiers": [parent_key],
+        "name": DEVICE_NAME,
+        "manufacturer": "Landbook",
+        "model": os.environ.get("PRODUCT_KEY") or "TSL LAN device",
+        "serial_number": parent_key,
+    }
+    total_cfg = {
+        "name": "Smart socket total power",
+        "object_id": f"{DEVICE_OBJECT_ID}_smart_socket_total_power",
+        "has_entity_name": True,
+        "state_topic": f"{base_topic}/smart_sockets/total_power",
+        "unit_of_measurement": "W",
+        "device_class": "power",
+        "state_class": "measurement",
+        "force_update": True,
+        "unique_id": f"{parent_key}_smart_socket_total_power",
+        "device": total_device,
+        "availability_topic": socket_liveness_topic,
+        "payload_available": "online",
+        "payload_not_available": "offline",
+    }
+    mqtt.publish(f"homeassistant/sensor/{parent_key}/smart_socket_total_power/config", json.dumps(total_cfg), retain=True)
+
+    for dev in socket_devices:
+        dk = dev["device_key"]
+        socket_availability_topic = f"{base_topic}/smart_sockets/{dk}/availability"
+        # Doppia disponibilità in modalità "all": la presa è disponibile solo se
+        # SIA il bridge è vivo (topic di liveness DEDICATO alle prese, con Last
+        # Will proprio → offline solo se l'add-on si spegne, indipendente dalla
+        # powerstation) SIA la presa è online sul cloud. Così spegnendo il bridge
+        # le prese vanno offline, ma un freeze/outage LAN della powerstation NON
+        # le tocca, e resta il rilevamento della singola presa scollegata.
+        socket_availability = [
+            {"topic": socket_liveness_topic,
+             "payload_available": "online", "payload_not_available": "offline"},
+            {"topic": socket_availability_topic,
+             "payload_available": "online", "payload_not_available": "offline"},
+        ]
+        slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in dk).strip("_")
+        socket_name = str(dev.get("name") or dk)
+        device = {
+            "identifiers": [f"wonderfree_socket_{dk}"],
+            "name": socket_name,
+            "manufacturer": "Wonderfree",
+            "model": dev.get("product_name") or dev.get("product_key") or "Smart socket",
+            "serial_number": dk,
+            "via_device": parent_key,
+        }
+        mqtt.publish(f"homeassistant/binary_sensor/wonderfree_socket_{dk}/power_state/config", b"", retain=True)
+        mqtt.publish(f"homeassistant/switch/wonderfree_socket_{dk}/switch/config", b"", retain=True)
+        switch_cfg = {
+            "name": "Switch",
+            "object_id": f"wonderfree_socket_{slug}_device_switch",
+            "has_entity_name": True,
+            "state_topic": f"{base_topic}/smart_sockets/{dk}/switch",
+            "command_topic": f"{base_topic}/smart_sockets/{dk}/set/switch",
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "stat_t": f"{base_topic}/smart_sockets/{dk}/switch",
+            "cmd_t": f"{base_topic}/smart_sockets/{dk}/set/switch",
+            "pl_on": "ON",
+            "pl_off": "OFF",
+            "optimistic": False,
+            "icon": "mdi:power-socket-eu",
+            "unique_id": f"wonderfree_socket_{dk}_device_switch",
+            "device": device,
+            "availability": socket_availability,
+            "availability_mode": "all",
+        }
+        mqtt.publish(f"homeassistant/switch/wonderfree_socket_{dk}_device/switch/config", json.dumps(switch_cfg), retain=True)
+        for sid, (name, unit, device_class, state_class) in SMART_SOCKET_SENSOR_DEFS.items():
+            mqtt.publish(f"homeassistant/sensor/wonderfree_socket_{dk}/{sid}/config", b"", retain=True)
+            cfg = {
+                "name": name,
+                "object_id": f"wonderfree_socket_{slug}_device_{sid}",
+                "has_entity_name": True,
+                "state_topic": f"{base_topic}/smart_sockets/{dk}/{sid}",
+                "unique_id": f"wonderfree_socket_{dk}_device_{sid}",
+                "force_update": True,
+                "device": device,
+                "availability": socket_availability,
+                "availability_mode": "all",
+            }
+            if unit:
+                cfg["unit_of_measurement"] = unit
+            if device_class:
+                cfg["device_class"] = device_class
+            if state_class:
+                cfg["state_class"] = state_class
+            mqtt.publish(f"homeassistant/sensor/wonderfree_socket_{dk}_device/{sid}/config", json.dumps(cfg), retain=True)
+        mqtt.publish(socket_availability_topic, b"", retain=True)
+    print(f"Smart socket discovery published: {len(socket_devices)}", flush=True)
+
+
+def _remove_smart_socket_from_ha(mqtt, base_topic, dk) -> None:
+    """Il device è stato eliminato dall'app: rimuovi le sue entità da HA
+    pubblicando config vuote retained (HA le cancella da solo)."""
+    mqtt.publish(f"homeassistant/switch/wonderfree_socket_{dk}_device/switch/config", b"", retain=True)
+    mqtt.publish(f"homeassistant/switch/wonderfree_socket_{dk}/switch/config", b"", retain=True)
+    mqtt.publish(f"homeassistant/binary_sensor/wonderfree_socket_{dk}/power_state/config", b"", retain=True)
+    for sid in SMART_SOCKET_SENSOR_DEFS:
+        mqtt.publish(f"homeassistant/sensor/wonderfree_socket_{dk}_device/{sid}/config", b"", retain=True)
+        mqtt.publish(f"homeassistant/sensor/wonderfree_socket_{dk}/{sid}/config", b"", retain=True)
+    mqtt.publish(f"{base_topic}/smart_sockets/{dk}/availability", "offline", retain=True)
+
+
+def _sync_smart_sockets_from_cloud(mqtt, base_topic, args, raw_devices) -> dict:
+    """Allinea l'insieme delle prese alla device-list cloud (live).
+
+    - Nuove prese → discovery HA + aggiunta in cache.
+    - Prese assenti da >= SMART_SOCKET_NOT_FOUND_LIMIT poll → rimosse da HA e cache.
+    Ritorna {device_key: online(bool)} dalla lista live.
+    """
+    from wf_socket_cloud import extract_sockets
+    live = extract_sockets(raw_devices or [])
+    live_by_dk = {d["device_key"]: d for d in live if d.get("device_key")}
+
+    data = _load_discovered_cache()
+    known = {
+        d.get("device_key"): d
+        for d in (data.get("smart_socket_devices") or [])
+        if isinstance(d, dict) and d.get("device_key")
+    }
+
+    nf = getattr(args, "_socket_not_found", None)
+    if not isinstance(nf, dict):
+        nf = {}
+
+    added = [dev for dk, dev in live_by_dk.items() if dk not in known]
+    for dk in live_by_dk:
+        nf.pop(dk, None)
+
+    removed = []
+    for dk in list(known):
+        if dk not in live_by_dk:
+            nf[dk] = nf.get(dk, 0) + 1
+            print(f"[socket-cloud] {dk} assente dalla device-list "
+                  f"({nf[dk]}/{SMART_SOCKET_NOT_FOUND_LIMIT})", flush=True)
+            if nf[dk] >= SMART_SOCKET_NOT_FOUND_LIMIT:
+                removed.append(dk)
+    args._socket_not_found = nf
+
+    if added or removed:
+        new_set = []
+        for dk, dev in live_by_dk.items():
+            new_set.append({
+                "device_key": dev.get("device_key", ""),
+                "product_key": dev.get("product_key", ""),
+                "name": dev.get("name", ""),
+                "product_name": dev.get("product_name", "Smart socket"),
+            })
+        # Conserva le prese ancora nel periodo di grazia (assenti ma non oltre soglia).
+        for dk, dev in known.items():
+            if dk not in live_by_dk and dk not in removed:
+                new_set.append(dev)
+        data["smart_socket_devices"] = new_set
+        _save_discovered_cache(data)
+
+    if added:
+        print(f"[socket-cloud] nuove prese rilevate: {[d['device_key'] for d in added]}", flush=True)
+        _publish_smart_socket_discovery(mqtt, base_topic, args)
+    for dk in removed:
+        _remove_smart_socket_from_ha(mqtt, base_topic, dk)
+        nf.pop(dk, None)
+        print(f"[socket-cloud] presa {dk} eliminata dall'app — rimossa da HA", flush=True)
+
+    return {dk: bool(dev.get("online")) for dk, dev in live_by_dk.items()}
+
+
+def _poll_smart_sockets(mqtt, base_topic, args) -> None:
+    if not getattr(args, "smart_sockets_enabled", True):
+        return
+    discovered = _load_discovered_cache()
+    online_map = None
+    used_cloud = False
+
+    cloud = _socket_cloud()
+    if cloud is not None and cloud.available():
+        used_cloud = True
+        try:
+            token = cloud.ensure_token()
+            if token:
+                discovered["token"] = token
+        except Exception as exc:
+            _dprint(f"[socket-cloud] token refresh fallito: {exc}", flush=True)
+        raw = cloud.list_devices()
+        if raw is not None:
+            # Device-list ok → auto-detect + rimozioni + mappa online live.
+            online_map = _sync_smart_sockets_from_cloud(mqtt, base_topic, args, raw)
+        # raw None = errore transitorio: online_map resta None → "assume online",
+        # non tocchiamo le entità (come faceva il vecchio addon).
+
+    if not used_cloud:
+        # Nessuna credenziale / modulo assente: comportamento legacy.
+        online_map = _fetch_socket_online_status(discovered)
+
+    devices = _smart_socket_devices(args)
+    if not devices:
+        return
+    total_power = 0.0
+    any_power = False
+    for dev in devices:
+        dk = dev["device_key"]
+        if online_map is not None:
+            online = bool(online_map.get(dk, False))
+            mqtt.publish(
+                f"{base_topic}/smart_sockets/{dk}/availability",
+                "online" if online else "offline",
+                retain=True,
+            )
+            if not online:
+                continue
+        try:
+            values = _fetch_socket_attrs(discovered, dev)
+        except Exception as exc:
+            _dprint(f"smart socket poll failed for {dev.get('device_key')}: {exc}", flush=True)
+            continue
+        if online_map is None and values:
+            mqtt.publish(f"{base_topic}/smart_sockets/{dk}/availability", "online", retain=True)
+        for key, value in values.items():
+            mqtt.publish(f"{base_topic}/smart_sockets/{dk}/{key}", str(value), retain=True)
+        if "power" in values:
+            any_power = True
+            total_power += float(values.get("power") or 0)
+    if any_power:
+        mqtt.publish(f"{base_topic}/smart_sockets/total_power", str(round(total_power, 3)), retain=True)
+
+
+def _intelligent_charge_index_from_watts(value) -> int:
+    try:
+        watts = int(round(float(value)))
+    except (TypeError, ValueError):
+        raise ValueError("invalid intelligent charging power")
+    nearest = min(INTELLIGENT_CHARGING_WATTS, key=lambda x: abs(x - watts))
+    return INTELLIGENT_CHARGING_WATTS.index(nearest)
+
+
+def _intelligent_charge_watts_from_index(value) -> int:
+    try:
+        idx = int(value)
+    except (TypeError, ValueError):
+        idx = 0
+    if idx < 0 or idx >= len(INTELLIGENT_CHARGING_WATTS):
+        idx = 0
+    return INTELLIGENT_CHARGING_WATTS[idx]
+
+
+def _build_intelligent_charging_payload(watts) -> bytes:
+    power_idx = _intelligent_charge_index_from_watts(watts)
+    disabled = b"".join(ttlv_number(i, 0) for i in (1, 2, 3, 4))
+    always_on = (
+        ttlv_number(1, 127) +     # all weekdays
+        ttlv_number(2, 1) +       # 00:01
+        ttlv_number(3, 1439) +    # 23:59
+        ttlv_number(4, power_idx)
+    )
+    # The firmware reports ARRAY-of-STRUCT as a STRUCT tag whose children are
+    # anonymous id=0 STRUCT entries. Reuse that exact compact layout.
+    entry_tag = (0 << 3) | 4
+    entries = (
+        entry_tag.to_bytes(2, "big") + (4).to_bytes(2, "big") + disabled +
+        entry_tag.to_bytes(2, "big") + (4).to_bytes(2, "big") + always_on
+    )
+    return TIMED_CHARGE_CONNECTION_TAG.to_bytes(2, "big") + (2).to_bytes(2, "big") + entries
+
+
+def _extract_intelligent_charging_power(payload: bytes):
+    pos = payload.find(TIMED_CHARGE_CONNECTION_TAG.to_bytes(2, "big"))
+    if pos < 0 or pos + 4 > len(payload):
+        return None
+    pos += 2
+    count = int.from_bytes(payload[pos:pos + 2], "big")
+    pos += 2
+    if count <= 0 or count > 8:
+        return None
+    best_power = None
+    for _ in range(count):
+        if pos + 4 > len(payload):
+            return best_power
+        tag = int.from_bytes(payload[pos:pos + 2], "big")
+        pos += 2
+        if tag != 0x0004:
+            return best_power
+        field_count = int.from_bytes(payload[pos:pos + 2], "big")
+        pos += 2
+        fields = {}
+        for _field in range(field_count):
+            if pos + 3 > len(payload):
+                return best_power
+            ftag = int.from_bytes(payload[pos:pos + 2], "big")
+            pos += 2
+            fid = ftag >> 3
+            ftyp = ftag & 7
+            if ftyp in (0, 1):
+                fields[fid] = 1 if ftyp == 1 else 0
+                continue
+            if ftyp != 2:
+                return best_power
+            prefix = payload[pos]
+            pos += 1
+            marker = prefix & 0x7F
+            vlen = 2 if marker == 0x09 else marker + 1
+            if vlen > 8 or pos + vlen > len(payload):
+                return best_power
+            val = int.from_bytes(payload[pos:pos + vlen], "big")
+            pos += vlen
+            if prefix & 0x80:
+                val = -val
+            fields[fid] = val
+        if int(fields.get(1) or 0) or int(fields.get(2) or 0) or int(fields.get(3) or 0):
+            best_power = _intelligent_charge_watts_from_index(fields.get(4, 0))
+    return best_power
 
 
 def publish_discovery(mqtt, base_topic, args):
@@ -891,7 +1983,7 @@ def publish_discovery(mqtt, base_topic, args):
     # TSL fields.
     for sensor_id in SENSOR_DEFS:
         mqtt.publish(f"homeassistant/sensor/{device_key}/{sensor_id}/config", b"", retain=True)
-    args._published_sensor_configs = set()
+    _PUBLISHED_SENSOR_CONFIGS.clear()
 
     for switch_id, switch in SWITCH_HEX.items():
         sw_object_id = f"{DEVICE_OBJECT_ID}_{SWITCH_OBJECT_ID_OVERRIDES.get(switch_id, switch_id)}"
@@ -978,6 +2070,24 @@ def publish_discovery(mqtt, base_topic, args):
     if _tsl_number_overlay:
         print(f"[tsl_discovery] dynamic numbers published: {sorted(_tsl_number_overlay.keys())}",
               flush=True)
+
+    mqtt.publish(f"homeassistant/number/{device_key}/{INTELLIGENT_CHARGING_POWER_ID}/config", json.dumps({
+        "name": "Intelligent Charging Power",
+        "object_id": f"{DEVICE_OBJECT_ID}_{INTELLIGENT_CHARGING_POWER_ID}",
+        "has_entity_name": True,
+        "command_topic": f"{base_topic}/set/{INTELLIGENT_CHARGING_POWER_ID}",
+        "state_topic": f"{base_topic}/cmd_state/{INTELLIGENT_CHARGING_POWER_ID}",
+        "min": min(INTELLIGENT_CHARGING_WATTS),
+        "max": max(INTELLIGENT_CHARGING_WATTS),
+        "step": 200,
+        "mode": "slider",
+        "unit_of_measurement": "W",
+        "optimistic": False,
+        "unique_id": f"{device_key}_{INTELLIGENT_CHARGING_POWER_ID}",
+        "device": device,
+        "availability_topic": f"{base_topic}/availability",
+    }), retain=True)
+    _publish_smart_socket_discovery(mqtt, base_topic, args)
     _dprint(f"published discovery {APP_VERSION}", flush=True)
 
 
@@ -986,9 +2096,20 @@ def subscribe_command_topics(mqtt, base_topic, args=None):
     if args is not None:
         for select_id in (getattr(args, "_tsl_select_catalog", {}) or {}):
             topics.append(f"{base_topic}/set/{select_id}")
-        for number_id in (getattr(args, "_tsl_number_catalog", {}) or {}):
+        number_catalog = getattr(args, "_tsl_number_catalog", {}) or {}
+        for number_id in number_catalog:
             topics.append(f"{base_topic}/set/{number_id}")
+        # Compatibility with old retained HA entities that used /set/output_power.
+        if "output_power_set" in number_catalog:
+            topics.append(f"{base_topic}/set/output_power")
+        topics.append(f"{base_topic}/set/{INTELLIGENT_CHARGING_POWER_ID}")
+        for dev in _smart_socket_devices(args):
+            topics.append(f"{base_topic}/smart_sockets/{dev['device_key']}/set/switch")
+    if not topics:
+        print("no MQTT command topics to subscribe; TSL controls are empty", flush=True)
+        return False
     mqtt.subscribe(topics)
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1075,19 +2196,6 @@ def _build_tsl_payload(control_info, value):
     return ttlv_number(control_id, int(value))
 
 
-def _build_tsl_control_frame(code, value, key, iv, args, default_type=None):
-    info = _tsl_control_info(code, default_type)
-    payload = _build_tsl_payload(info, value)
-    if _is_debug() or getattr(args, "debug_tsl_commands", False):
-        print(
-            "TSL command "
-            f"code={code} id={info.get('id')} "
-            f"type={info.get('type') or info.get('dataType') or default_type} "
-            f"value={value} payload={payload.hex(' ')}",
-            flush=True,
-        )
-    return encode_cmd(0x0013, _next_packet_id(args), aes_encrypt(payload, key, iv))
-
 
 def _build_tsl_info_frame(info, value, key, iv, args, default_type=None):
     merged = dict(info or {})
@@ -1113,11 +2221,11 @@ def send_bus_refresh(sock, key, iv, args, mode=3):
 
 
 def send_bus_mask(sock, key, iv, args, ids=None):
-    mask_ids = ids if ids is not None else BUS_MASK_IDS
+    mask_ids = ids if ids is not None else resolve_bus_mask_ids(args)
     payload = b"".join(int(x).to_bytes(2, "big") for x in mask_ids)
     frame = encode_cmd(0x0011, _next_packet_id(args), aes_encrypt(payload, key, iv))
     _send_frame(sock, args, frame)
-    _dprint(f"sent bus_mask ids={len(mask_ids)}", flush=True)
+    _dprint(f"sent bus_mask ids={len(mask_ids)} mode=tsl", flush=True)
 
 
 def send_report_subscription(sock, key, iv, args):
@@ -1132,24 +2240,7 @@ def send_report_subscription(sock, key, iv, args):
 # Battery cache
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_battery_cache(args):
-    return {}
-
-
-def save_battery_cache(cache, decoded, args):
-    return
-
-
 SWITCH_CACHE_PATH = "/data/landbook_switch_cache.json"
-_SWITCH_CACHE_KEYS = set(SWITCH_HEX.keys()) | {"mode"}
-
-
-def load_switch_cache() -> dict:
-    return {}
-
-
-def save_switch_cache(states: dict) -> None:
-    return
 
 
 def cleanup_disabled_cache_files(args):
@@ -1165,16 +2256,19 @@ def cleanup_disabled_cache_files(args):
 
 
 def publish_wifi_frozen_alert(mqtt, topic, *, reason, streak=None, duration=None):
+    messages = {
+        "sensor_silence": "PowerStation WiFi/LAN reporting frozen. Riavviare il WiFi del router o la powerstation.",
+    }
     payload = {
         "reason": reason,
         "ts": int(time.time()),
-        "message": "PowerStation WiFi/LAN reporting frozen. Riavviare il WiFi del router o la powerstation.",
+        "message": messages.get(reason, "PowerStation WiFi/LAN reporting frozen. Riavviare il WiFi del router o la powerstation."),
     }
     if streak is not None:
         payload["streak"] = int(streak)
     if duration is not None:
         payload["duration"] = int(duration)
-    mqtt.publish(f"{topic}/event/wifi_frozen", json.dumps(payload), retain=False)
+    mqtt.publish_resilient(f"{topic}/event/wifi_frozen", json.dumps(payload), retain=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1191,7 +2285,14 @@ def _sensor_value(key, value):
                 minutes = int(float(value))
         except (TypeError, ValueError):
             return value
-        hours, mins = divmod(max(minutes, 0), 60)
+        days, rem = divmod(max(minutes, 0), 1440)
+        hours, mins = divmod(rem, 60)
+        if days:
+            if hours and mins:
+                return f"{days}g {hours}h {mins}min"
+            if hours:
+                return f"{days}g {hours}h"
+            return f"{days}g"
         if hours and mins:
             return f"{hours}h {mins}min"
         if hours:
@@ -1208,6 +2309,9 @@ def _humanize_sensor_id(sensor_id: str) -> str:
         "grid_b_power": "Grid AC Power",
         "grid_freq": "Grid Frequency",
         "remaining_time_minutes": "Tempo residuo",
+        "uptime_minutes_lan": "HMI Field1 (uptime? non confermato)",
+        "hmi_field1_raw": "HMI Field1 Raw",
+        "hmi_field2_uptime_candidate": "Uptime Minutes (candidato)",
     }
     if sensor_id in overrides:
         return overrides[sensor_id]
@@ -1233,7 +2337,9 @@ def _infer_sensor_meta(sensor_id: str):
     elif "temp" in lc:
         unit, device_class, state_class = "°C", "temperature", "measurement"
     elif lc.endswith("_wh") or "_wh_" in lc:
-        unit, device_class, state_class = "Wh", "energy", "measurement"
+        unit, device_class = "Wh", "energy"
+        # Remaining Wh is a point-in-time capacity, not an energy meter.
+        state_class = None if "remaining" in lc else "total_increasing"
     elif "soc" in lc or "percentage" in lc:
         unit, device_class, state_class = "%", "battery", "measurement"
     elif lc == "remaining_time_minutes":
@@ -1245,30 +2351,6 @@ def _infer_sensor_meta(sensor_id: str):
     return name, unit, device_class, state_class
 
 
-def _publish_walker_shadow(mqtt, base_topic: str, walker_out: dict, legacy_out: dict) -> None:
-    """Publish the TTLV walker output under <base_topic>/sensors_v2/ so the user
-    can compare it side-by-side with the legacy decoder before switching over.
-
-    A summary delta is also published once per frame on <base_topic>/walker_diff
-    so a Home Assistant template sensor (or `mosquitto_sub`) can spot drift."""
-    diff_keys = []
-    for code, val in walker_out.items():
-        mqtt.publish(f"{base_topic}/sensors_v2/{code}", str(val), retain=False)
-        legacy_val = legacy_out.get(code)
-        if legacy_val is None:
-            diff_keys.append(f"+{code}")
-        else:
-            try:
-                if abs(float(val) - float(legacy_val)) > 0.5:
-                    diff_keys.append(f"~{code}")
-            except (TypeError, ValueError):
-                if str(val) != str(legacy_val):
-                    diff_keys.append(f"~{code}")
-    for code in legacy_out:
-        if code not in walker_out:
-            diff_keys.append(f"-{code}")
-    if diff_keys:
-        mqtt.publish(f"{base_topic}/walker_diff", ",".join(sorted(diff_keys)), retain=False)
 
 
 _PUBLISHED_SENSOR_CONFIGS = set()
@@ -1350,6 +2432,7 @@ for _cell in range(1, 15):
     _TSL_DUPLICATE_PREFERRED_KEYS[f"bms_celldata_no_cellvoltage{_cell}"] = f"battery_cell_{_cell:02d}_voltage"
 
 _INFER_NAME_KEYS = {
+    "hmi_field1_raw", "hmi_field2_uptime_candidate",
     "ac_input_power", "ac_output_power", "ac_output_voltage",
     "battery_current", "battery_cycles", "battery_percentage",
     "battery_remaining_wh", "battery_total_power", "battery_voltage",
@@ -1420,7 +2503,7 @@ def apply_tsl_preferred_aliases(decoded):
         if preferred == "battery_percentage":
             return 0.0 <= n <= 100.0
         if preferred == "remaining_time_minutes":
-            return 0.0 <= n <= 100000.0
+            return 0.0 <= n <= 1440.0
         if preferred == "grid_voltage":
             return 0.0 <= n <= 300.0
         if preferred == "pv_panel_voltage":
@@ -1604,6 +2687,55 @@ def apply_battery_power_balance(cache, decoded, args):
 
 
 
+def normalize_remaining_time_from_frame(decoded, cache):
+    """Normalizza il tempo residuo usando solo il valore TSL reale.
+
+    Sorgente accettata: battery_data.remaining_time, che il walker espone come
+    `remaining_time` e poi come `remaining_time_minutes`.
+
+    `pack_data` non viene usato: è per pacchi/moduli batteria aggiuntivi.
+    Valori enormi tipo 8177/42752/43008 vengono eliminati e HA mantiene
+    l'ultimo valore valido.
+    """
+    if ("remaining_time_minutes" not in decoded
+            and "remaining_time" not in decoded
+            and "battery_data_remaining_time" not in decoded
+            and "battery_data" not in decoded):
+        return set()
+
+    def _to_int(value):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+    raw_minutes = _to_int(decoded.get("remaining_time_minutes"))
+    tsl_minutes = _to_int(decoded.get("remaining_time"))
+    battery_data_path_minutes = _to_int(decoded.get("battery_data_remaining_time"))
+    battery_data_minutes = _to_int(decoded.get("battery_data"))
+
+    # Sorgente primaria: TSL battery_data.remaining_time.
+    # Il TSL ufficiale ha max=65535 Minutes e l'app può mostrare anche più giorni
+    # in Standby. Quindi NON tagliare a 24h: accetta il valore TSL reale.
+    # Scarta solo sentinelle/valori palesemente sporchi osservati nei frame corrotti.
+    invalid_remaining_values = {42752, 43008, 65535}
+    for minutes in (battery_data_path_minutes, tsl_minutes, battery_data_minutes, raw_minutes):
+        if minutes is not None and 0 < minutes <= 65534 and minutes not in invalid_remaining_values:
+            decoded["remaining_time_minutes"] = minutes
+            cache["_last_valid_remaining_time_minutes"] = minutes
+            return {"remaining_time_minutes"}
+
+    # Valore assente o assurdo: non pubblicare il tempo sbagliato.
+    # Se esiste un ultimo valore valido nella sessione, ripubblica quello per evitare Unknown.
+    last = _to_int(cache.get("_last_valid_remaining_time_minutes") or cache.get("remaining_time_minutes"))
+    if last is not None and 0 < last <= 65534 and last not in invalid_remaining_values:
+        decoded["remaining_time_minutes"] = last
+        return {"remaining_time_minutes"}
+
+    decoded.pop("remaining_time_minutes", None)
+    return set()
+
+
 def guard_zero_remaining_time(decoded, cache):
     """Evita di pubblicare 0h quando la LAN/app manda remaining_time_minutes=0
     durante micro-carichi o PV leggero. In quel caso Home Assistant deve mantenere
@@ -1630,7 +2762,7 @@ def guard_zero_remaining_time(decoded, cache):
     outp = max(_num("grid_b_power"), _num("ac_output_power"), _num("dc_output_power"), _num("total_output_power"))
     inp = max(pv, _num("ac_input_power"), _num("total_input_power"))
 
-    # La FPPT-T2400 con PV leggero / carico minimo invia spesso 0 minuti anche se
+    # Alcuni modelli con PV leggero / carico minimo inviano spesso 0 minuti anche se
     # la batteria è al 50%: non è un tempo reale, è "non calcolabile".
     if abs(power) < 30.0 and outp < 30.0 and inp < 30.0:
         decoded.pop("remaining_time_minutes", None)
@@ -1639,529 +2771,76 @@ def guard_zero_remaining_time(decoded, cache):
     # Se invece c'è potenza reale ma la LAN manda 0, lascia che il fallback stimato
     # ricalcoli il tempo dopo l'update del cache.
 
-def apply_battery_remaining_time_estimate(cache, args, decoded=None):
-    capacity = float(getattr(args, "battery_capacity_wh", 0) or 0)
-    if capacity <= 0:
-        return set()
-    estimate_allowed = "remaining_time_minutes" not in cache
-    decoded_minutes = None
-    if decoded is not None and "remaining_time_minutes" in decoded:
-        try:
-            decoded_minutes = int(float(decoded["remaining_time_minutes"] or 0))
-            estimate_allowed = decoded_minutes == 0
-        except (TypeError, ValueError):
-            estimate_allowed = False
-    try:
-        soc = float(cache["battery_percentage"])
-        power = float(cache["battery_total_power"])
-    except (KeyError, TypeError, ValueError):
-        return set()
-    if not 0 <= soc <= 100:
-        return set()
-
-    min_power_w = 20.0
-    if abs(power) < min_power_w:
-        return set()
-
-    if power > 0:
-        target_wh = capacity * max(0.0, 100.0 - soc) / 100.0
-    else:
-        target_wh = capacity * soc / 100.0
-        usable_ratio = float(getattr(args, "battery_discharge_usable_ratio", 0.88) or 0.88)
-        usable_ratio = max(0.5, min(1.0, usable_ratio))
-        target_wh *= usable_ratio
-
-    if target_wh <= 0:
-        minutes = 0
-    else:
-        minutes = max(1, int(round(target_wh / abs(power) * 60.0)))
-    if minutes > 100000:
-        return set()
-
-    if decoded_minutes is not None and decoded_minutes > 0:
-        max_reasonable_minutes = max(1440, minutes * 4)
-        if decoded_minutes <= max_reasonable_minutes:
-            return set()
-        cache["remaining_time_minutes"] = minutes
-        return {"remaining_time_minutes"}
-
-    if not estimate_allowed:
-        return set()
-
-    # evita salti 0h <-> valore stimato quando la LAN restituisce 0
-    prev = cache.get("remaining_time_minutes")
-    if minutes <= 0 and prev:
-        minutes = prev
-    if prev == minutes:
-        return set()
-    cache["remaining_time_minutes"] = minutes
-    return {"remaining_time_minutes"}
-
-
-def apply_battery_soc_tracking(cache, decoded, args):
-    capacity = float(getattr(args, "battery_capacity_wh", 0) or 0)
-    if capacity <= 0 or not getattr(args, "battery_soc_estimate", False):
-        return set()
-    now = time.time()
-    if "battery_percentage" in decoded:
-        try:
-            soc = float(decoded["battery_percentage"])
-        except (TypeError, ValueError):
-            return set()
-        if 0 <= soc <= 100:
-            cache["_battery_soc_estimate_wh"] = capacity * soc / 100.0
-            cache["_battery_soc_estimate_ts"] = now
-        return set()
-    if "_battery_soc_estimate_wh" not in cache or "battery_total_power" not in cache:
-        return set()
-    try:
-        wh = float(cache["_battery_soc_estimate_wh"])
-        last_ts = float(cache["_battery_soc_estimate_ts"])
-        power = float(cache["battery_total_power"])
-    except (TypeError, ValueError):
-        return set()
-    dt = now - last_ts
-    if dt <= 0 or dt > 300:
-        cache["_battery_soc_estimate_ts"] = now
-        return set()
-    changed = set()
-    wh = max(0.0, min(capacity, wh + power * dt / 3600.0))
-    cache["_battery_soc_estimate_wh"] = wh
-    cache["_battery_soc_estimate_ts"] = now
-    soc = round(100.0 * wh / capacity, 1)
-    soc = int(soc) if float(soc).is_integer() else soc
-    if cache.get("battery_percentage") != soc:
-        cache["battery_percentage"] = soc
-        changed.add("battery_percentage")
-    remaining_wh = int(round(wh))
-    if cache.get("battery_remaining_wh") != remaining_wh:
-        cache["battery_remaining_wh"] = remaining_wh
-        changed.add("battery_remaining_wh")
-    return changed
-
-
 def apply_device_status_correction(cache, decoded):
-    """Deriva lo stato reale usando potenze correnti oltre al codice firmware."""
-    if "device_status_raw" not in decoded:
-        return set()
-    status_raw = decoded["device_status_raw"]
-    now = time.time()
+    """Deriva lo stato operativo reale per carica/scarica.
 
-    if status_raw == 4:
-        cache.pop("_status_grid_seen_ts", None)
-        new_label = "Bypass"
-        if cache.get("device_status") != new_label:
-            cache["device_status"] = new_label
-            return {"device_status"}
+    Su questa powerstation il codice firmware `device_status_raw` può restare a
+    1/"In carica" anche mentre il Micro-Inverter sta erogando 100 W e la
+    batteria sta realmente scaricando. Per Home Assistant quindi pubblichiamo
+    lo stato dalla fisica dei flussi:
+
+      - battery_total_power < 0  -> In scarica
+      - battery_total_power > 0 con uscita attiva -> Carica e scarica
+      - battery_total_power > 0 senza uscita -> In carica
+      - potenze quasi zero -> Standby
+
+    Il valore raw resta disponibile come `device_status_raw`; non viene più
+    usato per sovrascrivere lo stato quando le potenze dicono il contrario.
+    """
+    if not any(k in decoded for k in (
+        "device_status_raw", "battery_total_power", "grid_b_power",
+        "ac_output_power", "dc_output_power", "pv_input_power", "ac_input_power",
+    )):
         return set()
 
     def _num(key):
         try:
-            return float(cache.get(key) if key in cache else decoded.get(key) or 0)
+            val = decoded.get(key) if key in decoded else cache.get(key)
+            return float(val or 0)
         except (TypeError, ValueError):
             return 0.0
 
-    battery_power = _num("battery_total_power")
-    grid_power = _num("grid_b_power")
-    ac_output_power = _num("ac_output_power")
-    dc_output_power = _num("dc_output_power")
-    output_power = max(grid_power, ac_output_power, dc_output_power)
-    input_power = max(_num("pv_input_power"), _num("ac_input_power"))
+    def _raw_status():
+        try:
+            return int(float(decoded.get("device_status_raw", cache.get("device_status_raw") or 0)))
+        except (TypeError, ValueError):
+            return None
 
-    # Evita rimbalzi Standby/In carica/In scarica causati da rumore intorno a 0 W.
-    # L'app ufficiale resta in Standby con PV 5-10 W e batteria +/-10 W.
-    status_deadband_w = 30.0
-    active_power_w = 30.0
-    pv_active_w = 5.0
-    standby_drain_w = 60.0
-    standby_pv_w = 15.0
-
-    if output_power > active_power_w:
-        cache["_status_grid_seen_ts"] = now
-
-    last_seen = float(cache.get("_status_grid_seen_ts") or 0)
-    output_recent = (now - last_seen) < 120
-
-    if battery_power > status_deadband_w and output_power > active_power_w:
-        new_label = "Carica e scarica"
-    elif input_power > pv_active_w and output_power > active_power_w:
-        new_label = "Carica e scarica"
-    elif output_power < active_power_w and input_power < standby_pv_w and abs(battery_power) < standby_drain_w:
-        new_label = "Standby"
-    elif abs(battery_power) < status_deadband_w and output_power < active_power_w and input_power < active_power_w:
-        new_label = "Standby"
-    elif battery_power < -status_deadband_w:
-        new_label = "In scarica"
-    elif battery_power > status_deadband_w and (output_power > active_power_w or output_recent):
-        new_label = "Carica e scarica"
-    elif battery_power > status_deadband_w or input_power > active_power_w:
-        if output_power > active_power_w:
-            new_label = "Carica e scarica" if input_power + status_deadband_w >= output_power else "In scarica"
-        else:
-            new_label = "In carica"
-    elif output_power > active_power_w:
-        new_label = "In scarica"
-    elif status_raw == 2:
-        new_label = "In scarica"
-    elif status_raw == 3:
-        new_label = "Carica e scarica"
+    status_raw = _raw_status()
+    if status_raw == 4:
+        new_label = "Bypass"
     else:
-        new_label = DEVICE_STATUS_LABELS.get(status_raw, f"Stato {status_raw}")
+        battery_power = _num("battery_total_power")
+        output_power = max(_num("grid_b_power"), _num("ac_output_power"), _num("dc_output_power"))
+        input_power = max(_num("pv_input_power"), _num("ac_input_power"))
+
+        deadband_w = 30.0
+        active_w = 30.0
+
+        if battery_power <= -deadband_w:
+            # Batteria negativa = sta alimentando i carichi/uscita.
+            new_label = "In scarica"
+        elif battery_power >= deadband_w:
+            # Batteria positiva = sta caricando. Se c'è anche uscita attiva,
+            # è il caso ibrido carica + scarica/carico.
+            new_label = "Carica e scarica" if output_power > active_w else "In carica"
+        elif input_power > active_w and output_power > active_w:
+            new_label = "Carica e scarica" if input_power + deadband_w >= output_power else "In scarica"
+        elif input_power > active_w:
+            new_label = "In carica"
+        elif output_power > active_w:
+            new_label = "In scarica"
+        elif abs(battery_power) < deadband_w and input_power < active_w and output_power < active_w:
+            new_label = "Standby"
+        elif status_raw is not None:
+            new_label = DEVICE_STATUS_LABELS.get(status_raw, f"Stato {status_raw}")
+        else:
+            return set()
 
     if cache.get("device_status") != new_label:
         cache["device_status"] = new_label
         return {"device_status"}
     return set()
-
-
-def apply_grid_frequency_default(cache, decoded, args):
-    if "grid_freq" in decoded:
-        return set()
-    default_freq = float(getattr(args, "grid_frequency_default", 0) or 0)
-    if default_freq <= 0:
-        return set()
-    def _num(key):
-        try:
-            return float(decoded.get(key) if key in decoded else cache.get(key) or 0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    has_grid_context = (
-        _num("grid_voltage") > 30.0 or
-        abs(_num("grid_b_power")) > 5.0 or
-        _num("ac_input_power") > 5.0 or
-        _num("ac_output_power") > 5.0
-    )
-    if not has_grid_context:
-        return set()
-    cache["grid_freq"] = int(default_freq) if float(default_freq).is_integer() else default_freq
-    return {"grid_freq"}
-
-
-def zero_sensor_values_for_frame(cache, decoded):
-    if (decoded.get("grid_b_power") == 0 and decoded.get("ac_input_power") == 0
-            and decoded.get("ac_output_power") == 0 and "grid_voltage" not in decoded):
-        val = 0
-        return {"grid_voltage": val} if cache.get("grid_voltage") != val else {}
-    return {}
-
-
-def _decoded_reports_ac_off(decoded):
-    if decoded.get("device_status_raw") == 0:
-        return True
-    if decoded.get("device_status") == "Standby":
-        return True
-    profile = decoded.get("work_profile")
-    if isinstance(profile, str):
-        parts = profile.split(",", 1)
-        if parts and parts[0].strip() == "0":
-            return True
-    return False
-
-
-def suppress_transient_ac_zeros(cache, decoded, args):
-    hold_seconds = float(getattr(args, "ac_zero_hold_seconds", 0) or 0)
-    if hold_seconds <= 0:
-        return set()
-    if _decoded_reports_ac_off(decoded):
-        cache.pop("_ac_zero_pending_since", None)
-        return set()
-    now = time.time()
-    has_real = any(
-        k in decoded and float(decoded.get(k) or 0) != 0
-        for k in AC_TRANSIENT_ZERO_KEYS
-    )
-    if has_real:
-        cache.pop("_ac_zero_pending_since", None)
-        return set()
-    suppress = {
-        k for k in AC_TRANSIENT_ZERO_KEYS
-        if k in decoded and float(decoded.get(k) or 0) == 0 and float(cache.get(k) or 0) != 0
-    }
-    if not suppress:
-        cache.pop("_ac_zero_pending_since", None)
-        return set()
-    pending_since = cache.setdefault("_ac_zero_pending_since", now)
-    if now - float(pending_since) >= hold_seconds:
-        cache.pop("_ac_zero_pending_since", None)
-        return set()
-    for k in suppress:
-        decoded.pop(k, None)
-    if any(k in suppress for k in ("grid_b_power", "ac_output_power")):
-        decoded.pop("total_output_power", None)
-    if "ac_input_power" in suppress:
-        decoded.pop("total_input_power", None)
-    return suppress
-
-
-def words16(data):
-    return [int.from_bytes(data[i:i + 2], "big") for i in range(0, len(data) - 1, 2)]
-
-
-def extract_reported_command_states(plain):
-    ws = words16(plain)
-    reported = {}
-    _extract_output_power_set(plain, reported)
-    if "output_power_set" in reported:
-        reported["output_power"] = str(reported.pop("output_power_set"))
-    if len(ws) == 1 and ws[0] in GRID_STATE_WORDS:
-        reported["grid"] = GRID_STATE_WORDS[ws[0]]
-    if len(ws) >= 1 and ws[0] in AC_STATE_WORDS:
-        reported["ac"] = AC_STATE_WORDS[ws[0]]
-    if len(ws) >= 2 and ws[1] in DC_STATE_WORDS:
-        reported["dc"] = DC_STATE_WORDS[ws[1]]
-    for switch_id, mapping in STATE_TAGS.items():
-        for w in reversed(ws):
-            if w in mapping:
-                reported[switch_id] = mapping[w]
-                break
-    for switch_id, tag_map in VALUE_STATES.items():
-        for i in range(len(ws) - 1, 0, -1):
-            value_map = tag_map.get(ws[i - 1])
-            if value_map and ws[i] in value_map:
-                reported[switch_id] = value_map[ws[i]]
-                break
-    for i in range(len(ws) - 1):
-        if ws[i] == 0x00DA and ws[i + 1] in MODE_LABEL_BY_VAL:
-            reported["mode"] = MODE_LABEL_BY_VAL[ws[i + 1]]
-    return reported
-
-
-def _set_pending_command_state(args, command_id, value, seconds=45):
-    if args is None:
-        return
-    pending = getattr(args, "_pending_command_states", None)
-    if not isinstance(pending, dict):
-        pending = {}
-    pending[command_id] = {
-        "value": str(value),
-        "until": time.time() + float(seconds),
-    }
-    args._pending_command_states = pending
-
-
-def _command_state_allowed(args, command_id, value):
-    if args is None:
-        return True
-    pending = getattr(args, "_pending_command_states", None)
-    if not isinstance(pending, dict):
-        return True
-    wait = pending.get(command_id)
-    if not wait:
-        return True
-    expected = str(wait.get("value", ""))
-    current = str(value)
-    until = float(wait.get("until", 0) or 0)
-    now = time.time()
-    if current != expected and now <= until:
-        _dprint(f"ignored stale {command_id}={current}; waiting for {expected}", flush=True)
-        return False
-    pending.pop(command_id, None)
-    args._pending_command_states = pending
-    return True
-
-
-def publish_reported_command_states(mqtt, base_topic, reported, args=None):
-    filtered = {}
-    valid = set(SWITCH_HEX)
-    if args is not None:
-        valid.update((getattr(args, "_tsl_select_catalog", {}) or {}).keys())
-        valid.update((getattr(args, "_tsl_number_catalog", {}) or {}).keys())
-    for command_id, value in reported.items():
-        if command_id not in valid:
-            continue
-        if command_id in LEGACY_COMMAND_STATE_CLEANUP:
-            continue
-        if not _command_state_allowed(args, command_id, value):
-            continue
-        mqtt.publish(f"{base_topic}/cmd_state/{command_id}", value, retain=True)
-        filtered[command_id] = value
-    if filtered:
-        save_switch_cache(filtered)
-
-
-def publish_output_power_state(mqtt, base_topic, watts, source="LAN", args=None):
-    try:
-        watts = int(float(watts))
-    except (TypeError, ValueError):
-        return
-    if not 100 <= watts <= 800:
-        return
-    command_id = "output_power_set"
-    if args is not None and command_id not in (getattr(args, "_tsl_number_catalog", {}) or {}):
-        return
-    if not _command_state_allowed(args, command_id, str(watts)):
-        return
-    mqtt.publish(f"{base_topic}/cmd_state/{command_id}", str(watts), retain=True)
-    _dprint(f"{source} output_power_set={watts}W", flush=True)
-
-
-def _initial_command_states_from_env() -> dict:
-    raw = os.environ.get("WF_SWITCH_STATES", "").strip()
-    if not raw:
-        return {}
-    states = {}
-    valid = set(SWITCH_HEX)
-    for part in raw.split(","):
-        if "=" not in part:
-            continue
-        key, value = part.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if key in valid and value:
-            states[key] = value
-    return states
-
-
-def publish_initial_command_states(mqtt, base_topic, args=None):
-    initial = _initial_command_states_from_env()
-    for command_id in LEGACY_COMMAND_STATE_CLEANUP:
-        mqtt.publish(f"{base_topic}/cmd_state/{command_id}", b"", retain=True)
-    for switch_id in SWITCH_HEX:
-        mqtt.publish(f"{base_topic}/cmd_state/{switch_id}", initial.get(switch_id, b""), retain=True)
-    if args is not None:
-        for select_id, info in ((getattr(args, "_tsl_select_catalog", {}) or {}).items()):
-            current_label = info.get("current_label")
-            if current_label not in (None, ""):
-                mqtt.publish(f"{base_topic}/cmd_state/{select_id}", str(current_label), retain=True)
-        for number_id, info in ((getattr(args, "_tsl_number_catalog", {}) or {}).items()):
-            current_value = info.get("current_value")
-            if current_value not in (None, ""):
-                mqtt.publish(f"{base_topic}/cmd_state/{number_id}", str(current_value), retain=True)
-    if initial:
-        save_switch_cache(initial)
-
-
-def publish_inferred_command_states(mqtt, base_topic, cache, decoded, args=None):
-    inferred = {}
-
-    def _num(key):
-        try:
-            return float(decoded.get(key) if key in decoded else cache.get(key) or 0)
-        except (TypeError, ValueError):
-            return 0.0
-
-    # Segue le modifiche fatte dall'app usando solo prove fisiche dai sensori LAN.
-    # Evita la vecchia scansione generica dei frame, che poteva creare switch falsi.
-    grid_output_power = max(_num("grid_b_power"), _num("ac_output_power"))
-    if grid_output_power >= 5:
-        if args is not None:
-            args._grid_zero_reads = 0
-        inferred["grid"] = "ON"
-    elif "grid_power_switch_set" in decoded:
-        if bool(decoded.get("grid_power_switch_set")):
-            if args is not None:
-                args._grid_zero_reads = 0
-            inferred["grid"] = "ON"
-        else:
-            inferred["grid"] = "OFF"
-    elif cache.get("grid_power_switch_set") is False:
-        inferred["grid"] = "OFF"
-    elif cache.get("grid_power_switch_set") is True:
-        inferred["grid"] = "ON"
-    elif any(k in decoded for k in ("grid_b_power", "ac_output_power", "ac_input_power")):
-        # During Output Priority / grid startup the LAN stream can briefly
-        # report 0 W even though the command bit and the output settle to ON a
-        # moment later. Do not turn the HA switch off on a single zero sample.
-        if args is None:
-            inferred["grid"] = "OFF"
-        else:
-            zero_reads = int(getattr(args, "_grid_zero_reads", 0) or 0) + 1
-            args._grid_zero_reads = zero_reads
-            if zero_reads >= 3:
-                inferred["grid"] = "OFF"
-
-    dc_power = max(
-        _num("dc_output_power"),
-        _num("dc12v_power"),
-        _num("dc24v_power"),
-        _num("typec_1_power"),
-        _num("typec_2_power"),
-        _num("usb_a1_power"),
-        _num("usb_a2_power"),
-        _num("usb_a3_power"),
-        _num("usb_a4_power"),
-    )
-    if decoded.get("dc_switch") is False:
-        inferred["dc"] = "OFF"
-    elif decoded.get("dc_switch") is True:
-        # Some LAN frames mark dc_switch=True when only the auxiliary/LED rail
-        # is awake (for example USB voltage present with 0-1 W). Do not flip
-        # the HA switch on unless there is real DC output or the user cache
-        # already says the switch is on.
-        if dc_power >= 3 or cache.get("dc_switch") is True:
-            inferred["dc"] = "ON"
-        elif cache.get("dc_switch") is False:
-            inferred["dc"] = "OFF"
-    elif cache.get("dc_switch") is False:
-        inferred["dc"] = "OFF"
-    elif cache.get("dc_switch") is True:
-        inferred["dc"] = "ON"
-    elif dc_power >= 3:
-        inferred["dc"] = "ON"
-    elif any(k in decoded for k in (
-        "usb_a1_voltage",
-        "usb_a2_voltage",
-        "usb_a3_voltage",
-        "usb_a4_voltage",
-        "dc12v_voltage",
-        "dc24v_voltage",
-    )):
-        dc_voltage = max(
-            _num("usb_a1_voltage"),
-            _num("usb_a2_voltage"),
-            _num("usb_a3_voltage"),
-            _num("usb_a4_voltage"),
-            _num("dc12v_voltage"),
-            _num("dc24v_voltage"),
-        )
-        if dc_voltage <= 1:
-            inferred["dc"] = "OFF"
-
-    if inferred:
-        publish_reported_command_states(mqtt, base_topic, inferred, args)
-        _dprint(f"inferred command states from sensors: {inferred}", flush=True)
-    return inferred
-
-
-def apply_reported_sensor_overrides(cache, reported):
-    changed = set()
-
-    def set_zero(key):
-        if cache.get(key) != 0:
-            changed.add(key)
-        cache[key] = 0
-
-    if reported.get("grid") == "OFF":
-        for key in ("grid_b_power",):
-            set_zero(key)
-    if reported.get("dc") == "OFF":
-        for key in DC_OUTPUT_SENSOR_KEYS:
-            set_zero(key)
-    if changed:
-        apply_derived_sensors(cache)
-        changed.update(("total_input_power", "total_output_power"))
-    return changed
-
-
-def apply_explicit_switch_sensor_overrides(decoded, cache=None):
-    changed = set()
-    cache = cache or {}
-
-    def set_zero(key):
-        if decoded.get(key) != 0:
-            changed.add(key)
-        decoded[key] = 0
-
-    # The TSL switch state is authoritative. Some frames keep reporting a tiny
-    # phantom dc_output_power (observed 4 W) while the app and TSL say DC is off.
-    dc_is_off = decoded.get("dc_switch") is False or (
-        "dc_switch" not in decoded and cache.get("dc_switch") is False
-    )
-    if dc_is_off:
-        for key in DC_OUTPUT_SENSOR_KEYS:
-            set_zero(key)
-    return changed
 
 
 def apply_raw_status_labels(cache, decoded):
@@ -2250,11 +2929,35 @@ def handle_mqtt_command(topic, payload, device_sock, mqtt, base_topic, key, iv, 
     if not payload:
         return
 
+    number_catalog = getattr(args, "_tsl_number_catalog", {}) or {}
+    if command_id == "output_power" and "output_power_set" in number_catalog:
+        command_id = "output_power_set"
+
+    if command_id == INTELLIGENT_CHARGING_POWER_ID:
+        try:
+            watts = INTELLIGENT_CHARGING_WATTS[_intelligent_charge_index_from_watts(payload)]
+        except ValueError:
+            return
+        if not _command_tx_allowed(args, command_id, str(watts), opposite_window=0.0):
+            return
+        frame = encode_cmd(
+            0x0013,
+            _next_packet_id(args),
+            aes_encrypt(_build_intelligent_charging_payload(watts), key, iv),
+        )
+        _send_frame(device_sock, args, frame)
+        _set_pending_command_state(args, command_id, str(watts), seconds=120)
+        mqtt.publish(f"{base_topic}/cmd_state/{command_id}", str(watts), retain=True)
+        print(f"sent intelligent charging power {watts}W", flush=True)
+        args._next_bus_kick = time.time() + 2.0
+        args._cmd_grace_until = time.time() + 60
+        return
+
     if command_id in SWITCH_HEX:
         state = payload.upper()
         if state not in ("ON", "OFF"):
             return
-        opposite_window = GRID_OPPOSITE_WINDOW if command_id == "grid" else None
+        opposite_window = GRID_OPPOSITE_WINDOW if command_id == _grid_command_id() else None
         if not _command_tx_allowed(args, command_id, state, opposite_window=opposite_window):
             return
         switch = SWITCH_HEX[command_id]
@@ -2262,7 +2965,6 @@ def handle_mqtt_command(topic, payload, device_sock, mqtt, base_topic, key, iv, 
         _send_frame(device_sock, args, frame)
         _set_pending_command_state(args, command_id, state)
         mqtt.publish(f"{base_topic}/cmd_state/{command_id}", state, retain=True)
-        save_switch_cache({command_id: state})
         _dprint(f"sent {command_id} {state}", flush=True)
         args._next_bus_kick = time.time() + 2.0
         args._cmd_grace_until = time.time() + 60   # 60s grace dopo switch
@@ -2285,13 +2987,11 @@ def handle_mqtt_command(topic, payload, device_sock, mqtt, base_topic, key, iv, 
         _send_frame(device_sock, args, frame)
         _set_pending_command_state(args, command_id, payload)
         mqtt.publish(f"{base_topic}/cmd_state/{command_id}", payload, retain=True)
-        save_switch_cache({command_id: payload})
         _dprint(f"sent {command_id}={payload} (value={label_to_value[payload]})", flush=True)
         args._next_bus_kick = time.time() + 2.0
         args._cmd_grace_until = time.time() + 60
         return
 
-    number_catalog = getattr(args, "_tsl_number_catalog", {}) or {}
     if command_id in number_catalog:
         info = number_catalog[command_id]
         try:
@@ -2401,9 +3101,13 @@ def _invalidate_lan_key_cache() -> None:
 
 
 def _refresh_lan_key(args) -> bool:
+    global _BUS_MASK_CACHE, _BUS_MASK_SOURCE, _TSL_CONTROLS_CACHE
     try:
         from wf_autodiscovery import setup as _setup
         _setup(force=True)
+        _BUS_MASK_CACHE = None
+        _BUS_MASK_SOURCE = ""
+        _TSL_CONTROLS_CACHE = None
         new_hex = os.environ.get("LAN_KEY_HEX", "").strip()
         if new_hex:
             new_key = base64.b64encode(bytes.fromhex(new_hex)).decode("ascii")
@@ -2422,9 +3126,421 @@ def _refresh_lan_key(args) -> bool:
 # WiFi freeze recovery
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+def stop_addon_after_freeze(mqtt, availability_topic, topic, streak, duration):
+    """Ferma volontariamente l'add-on dopo freeze consecutivi.
+
+    Esce dal processo principale: con run.sh che fa `exec python3`, il servizio
+    dell'add-on termina invece di continuare a riconnettersi all'infinito.
+    """
+    print(
+        f"Freeze consecutivi={streak}: pubblico offline e spengo add-on",
+        flush=True,
+    )
+    try:
+        publish_wifi_frozen_alert(
+            mqtt,
+            topic,
+            reason="freeze_streak_shutdown",
+            streak=streak,
+            duration=duration,
+        )
+    except Exception as exc:
+        print(f"MQTT wifi_frozen shutdown alert failed: {exc}", flush=True)
+    try:
+        mqtt.publish_resilient(availability_topic, "offline", retain=True)
+    except Exception as exc:
+        print(f"MQTT availability offline publish failed: {exc}", flush=True)
+    try:
+        mqtt.disconnect()
+    except Exception:
+        pass
+    raise SystemExit(0)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Main loop
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+
+# ---- restored low-level command helpers ----
+
+
+def _decoded_reports_ac_off(decoded):
+    if decoded.get("device_status_raw") == 0:
+        return True
+    if decoded.get("device_status") == "Standby":
+        return True
+    profile = decoded.get("work_profile")
+    if isinstance(profile, str):
+        parts = profile.split(",", 1)
+        if parts and parts[0].strip() == "0":
+            return True
+    return False
+
+
+def words16(data):
+    return [int.from_bytes(data[i:i + 2], "big") for i in range(0, len(data) - 1, 2)]
+
+
+def _initial_command_states_from_env() -> dict:
+    raw = os.environ.get("WF_SWITCH_STATES", "").strip()
+    if not raw:
+        return {}
+    states = {}
+    valid = set(SWITCH_HEX)
+    for part in raw.split(","):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key in valid and value:
+            states[key] = value
+    return states
+
+# ---- end low-level command helpers ----
+
+# ---- restored command-state helpers (0.6.25 startup fix) ----
+
+
+def apply_grid_frequency_default(cache, decoded, args):
+    if "grid_freq" in decoded:
+        return set()
+    default_freq = float(getattr(args, "grid_frequency_default", 0) or 0)
+    if default_freq <= 0:
+        return set()
+    def _num(key):
+        try:
+            return float(decoded.get(key) if key in decoded else cache.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    has_grid_context = (
+        _num("grid_voltage") > 30.0 or
+        abs(_num("grid_b_power")) > 5.0 or
+        _num("ac_input_power") > 5.0 or
+        _num("ac_output_power") > 5.0
+    )
+    if not has_grid_context:
+        return set()
+    cache["grid_freq"] = int(default_freq) if float(default_freq).is_integer() else default_freq
+    return {"grid_freq"}
+
+
+def zero_sensor_values_for_frame(cache, decoded):
+    if (decoded.get("grid_b_power") == 0 and decoded.get("ac_input_power") == 0
+            and decoded.get("ac_output_power") == 0 and "grid_voltage" not in decoded):
+        val = 0
+        return {"grid_voltage": val} if cache.get("grid_voltage") != val else {}
+    return {}
+
+
+def suppress_transient_ac_zeros(cache, decoded, args):
+    hold_seconds = float(getattr(args, "ac_zero_hold_seconds", 0) or 0)
+    if hold_seconds <= 0:
+        return set()
+    if _decoded_reports_ac_off(decoded):
+        cache.pop("_ac_zero_pending_since", None)
+        return set()
+    now = time.time()
+    has_real = any(
+        k in decoded and float(decoded.get(k) or 0) != 0
+        for k in AC_TRANSIENT_ZERO_KEYS
+    )
+    if has_real:
+        cache.pop("_ac_zero_pending_since", None)
+        return set()
+    suppress = {
+        k for k in AC_TRANSIENT_ZERO_KEYS
+        if k in decoded and float(decoded.get(k) or 0) == 0 and float(cache.get(k) or 0) != 0
+    }
+    if not suppress:
+        cache.pop("_ac_zero_pending_since", None)
+        return set()
+    pending_since = cache.setdefault("_ac_zero_pending_since", now)
+    if now - float(pending_since) >= hold_seconds:
+        cache.pop("_ac_zero_pending_since", None)
+        return set()
+    for k in suppress:
+        decoded.pop(k, None)
+    if any(k in suppress for k in ("grid_b_power", "ac_output_power")):
+        decoded.pop("total_output_power", None)
+    if "ac_input_power" in suppress:
+        decoded.pop("total_input_power", None)
+    return suppress
+
+
+def extract_reported_command_states(plain):
+    ws = words16(plain)
+    reported = {}
+    _extract_output_power_set(plain, reported)
+    if "output_power_set" in reported:
+        reported["output_power"] = str(reported.pop("output_power_set"))
+    if len(ws) == 1 and ws[0] in GRID_STATE_WORDS:
+        reported["grid"] = GRID_STATE_WORDS[ws[0]]
+    if len(ws) >= 1 and ws[0] in AC_STATE_WORDS:
+        reported["ac"] = AC_STATE_WORDS[ws[0]]
+    if len(ws) >= 2 and ws[1] in DC_STATE_WORDS:
+        reported["dc"] = DC_STATE_WORDS[ws[1]]
+    for switch_id, mapping in STATE_TAGS.items():
+        for w in reversed(ws):
+            if w in mapping:
+                reported[switch_id] = mapping[w]
+                break
+    for switch_id, tag_map in VALUE_STATES.items():
+        for i in range(len(ws) - 1, 0, -1):
+            value_map = tag_map.get(ws[i - 1])
+            if value_map and ws[i] in value_map:
+                reported[switch_id] = value_map[ws[i]]
+                break
+    for i in range(len(ws) - 1):
+        if ws[i] == 0x00DA and ws[i + 1] in MODE_LABEL_BY_VAL:
+            reported["mode"] = MODE_LABEL_BY_VAL[ws[i + 1]]
+    return reported
+
+
+def _set_pending_command_state(args, command_id, value, seconds=45):
+    if args is None:
+        return
+    pending = getattr(args, "_pending_command_states", None)
+    if not isinstance(pending, dict):
+        pending = {}
+    pending[command_id] = {
+        "value": str(value),
+        "until": time.time() + float(seconds),
+    }
+    args._pending_command_states = pending
+
+
+def _command_state_allowed(args, command_id, value):
+    if args is None:
+        return True
+    pending = getattr(args, "_pending_command_states", None)
+    if not isinstance(pending, dict):
+        return True
+    wait = pending.get(command_id)
+    if not wait:
+        return True
+    expected = str(wait.get("value", ""))
+    current = str(value)
+    until = float(wait.get("until", 0) or 0)
+    now = time.time()
+    if current != expected and now <= until:
+        _dprint(f"ignored stale {command_id}={current}; waiting for {expected}", flush=True)
+        return False
+    pending.pop(command_id, None)
+    args._pending_command_states = pending
+    return True
+
+
+
+def _normalize_output_power_state_value(value):
+    """Normalize output_power_set values for HA number state.
+
+    The device can report the TSL raw value scaled x10 (e.g. 1000 for 100 W).
+    Home Assistant number range is real watts 100..800, so never publish raw x10.
+    """
+    try:
+        v = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    if 100 <= v <= 800:
+        return v
+    if 1000 <= v <= 8000 and v % 10 == 0:
+        return v // 10
+    return None
+
+def publish_reported_command_states(mqtt, base_topic, reported, args=None):
+    valid = set(SWITCH_HEX)
+    if args is not None:
+        valid.update((getattr(args, "_tsl_select_catalog", {}) or {}).keys())
+        valid.update((getattr(args, "_tsl_number_catalog", {}) or {}).keys())
+    for command_id, value in reported.items():
+        command_id = _canonical_command_id(command_id)
+        if command_id not in valid:
+            continue
+        if command_id in LEGACY_COMMAND_STATE_CLEANUP:
+            continue
+        if command_id == "output_power_set":
+            value = _normalize_output_power_state_value(value)
+            if value is None:
+                continue
+        if not _command_state_allowed(args, command_id, value):
+            continue
+        mqtt.publish(f"{base_topic}/cmd_state/{command_id}", str(value), retain=True)
+
+
+def publish_output_power_state(mqtt, base_topic, watts, source="LAN", args=None):
+    watts = _normalize_output_power_state_value(watts)
+    if watts is None:
+        return
+    command_id = "output_power_set"
+    if args is not None and command_id not in (getattr(args, "_tsl_number_catalog", {}) or {}):
+        return
+    if not _command_state_allowed(args, command_id, str(watts)):
+        return
+    mqtt.publish(f"{base_topic}/cmd_state/{command_id}", str(watts), retain=True)
+    _dprint(f"{source} output_power_set={watts}W", flush=True)
+
+
+def publish_initial_command_states(mqtt, base_topic, args=None):
+    initial = _initial_command_states_from_env()
+    for command_id in LEGACY_COMMAND_STATE_CLEANUP:
+        mqtt.publish(f"{base_topic}/cmd_state/{command_id}", b"", retain=True)
+    for switch_id in SWITCH_HEX:
+        mqtt.publish(f"{base_topic}/cmd_state/{switch_id}", initial.get(switch_id, b""), retain=True)
+    if args is not None:
+        for select_id, info in ((getattr(args, "_tsl_select_catalog", {}) or {}).items()):
+            current_label = info.get("current_label")
+            if current_label not in (None, ""):
+                mqtt.publish(f"{base_topic}/cmd_state/{select_id}", str(current_label), retain=True)
+        for number_id, info in ((getattr(args, "_tsl_number_catalog", {}) or {}).items()):
+            current_value = info.get("current_value")
+            if current_value not in (None, ""):
+                if number_id == "output_power_set":
+                    current_value = _normalize_output_power_state_value(current_value)
+                    if current_value is None:
+                        continue
+                mqtt.publish(f"{base_topic}/cmd_state/{number_id}", str(current_value), retain=True)
+
+
+def publish_inferred_command_states(mqtt, base_topic, cache, decoded, args=None):
+    inferred = {}
+    grid_id = _grid_command_id()
+    dc_id = _dc_command_id()
+
+    def _num(key):
+        try:
+            return float(decoded.get(key) if key in decoded else cache.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    # Segue le modifiche fatte dall'app usando solo prove fisiche dai sensori LAN.
+    # Evita la vecchia scansione generica dei frame, che poteva creare switch falsi.
+    grid_output_power = max(_num("grid_b_power"), _num("ac_output_power"))
+    if grid_id and grid_output_power >= 5:
+        if args is not None:
+            args._grid_zero_reads = 0
+        inferred[grid_id] = "ON"
+    elif grid_id and "grid_power_switch_set" in decoded:
+        if bool(decoded.get("grid_power_switch_set")):
+            if args is not None:
+                args._grid_zero_reads = 0
+            inferred[grid_id] = "ON"
+        else:
+            inferred[grid_id] = "OFF"
+    elif grid_id and cache.get("grid_power_switch_set") is False:
+        inferred[grid_id] = "OFF"
+    elif grid_id and cache.get("grid_power_switch_set") is True:
+        inferred[grid_id] = "ON"
+    elif grid_id and any(k in decoded for k in ("grid_b_power", "ac_output_power", "ac_input_power")):
+        # During Output Priority / grid startup the LAN stream can briefly
+        # report 0 W even though the command bit and the output settle to ON a
+        # moment later. Do not turn the HA switch off on a single zero sample.
+        if args is None:
+            inferred[grid_id] = "OFF"
+        else:
+            zero_reads = int(getattr(args, "_grid_zero_reads", 0) or 0) + 1
+            args._grid_zero_reads = zero_reads
+            if zero_reads >= 3:
+                inferred[grid_id] = "OFF"
+
+    dc_power = max(
+        _num("dc_output_power"),
+        _num("dc12v_power"),
+        _num("dc24v_power"),
+        _num("typec_1_power"),
+        _num("typec_2_power"),
+        _num("usb_a1_power"),
+        _num("usb_a2_power"),
+        _num("usb_a3_power"),
+        _num("usb_a4_power"),
+    )
+    if dc_id and decoded.get("dc_switch") is False:
+        inferred[dc_id] = "OFF"
+    elif dc_id and decoded.get("dc_switch") is True:
+        # Some LAN frames mark dc_switch=True when only the auxiliary/LED rail
+        # is awake (for example USB voltage present with 0-1 W). Do not flip
+        # the HA switch on unless there is real DC output or the user cache
+        # already says the switch is on.
+        if dc_power >= 3 or cache.get("dc_switch") is True:
+            inferred[dc_id] = "ON"
+        elif cache.get("dc_switch") is False:
+            inferred[dc_id] = "OFF"
+    elif dc_id and cache.get("dc_switch") is False:
+        inferred[dc_id] = "OFF"
+    elif dc_id and cache.get("dc_switch") is True:
+        inferred[dc_id] = "ON"
+    elif dc_id and dc_power >= 3:
+        inferred[dc_id] = "ON"
+    elif dc_id and any(k in decoded for k in (
+        "usb_a1_voltage",
+        "usb_a2_voltage",
+        "usb_a3_voltage",
+        "usb_a4_voltage",
+        "dc12v_voltage",
+        "dc24v_voltage",
+    )):
+        dc_voltage = max(
+            _num("usb_a1_voltage"),
+            _num("usb_a2_voltage"),
+            _num("usb_a3_voltage"),
+            _num("usb_a4_voltage"),
+            _num("dc12v_voltage"),
+            _num("dc24v_voltage"),
+        )
+        if dc_voltage <= 1:
+            inferred[dc_id] = "OFF"
+
+    if inferred:
+        publish_reported_command_states(mqtt, base_topic, inferred, args)
+        _dprint(f"inferred command states from sensors: {inferred}", flush=True)
+    return inferred
+
+
+def apply_reported_sensor_overrides(cache, reported):
+    changed = set()
+
+    def set_zero(key):
+        if cache.get(key) != 0:
+            changed.add(key)
+        cache[key] = 0
+
+    grid_id = _grid_command_id() or "grid"
+    dc_id = _dc_command_id() or "dc"
+    if reported.get(grid_id) == "OFF" or reported.get("grid") == "OFF":
+        for key in ("grid_b_power",):
+            set_zero(key)
+    if reported.get(dc_id) == "OFF" or reported.get("dc") == "OFF":
+        for key in DC_OUTPUT_SENSOR_KEYS:
+            set_zero(key)
+    if changed:
+        apply_derived_sensors(cache)
+        changed.update(("total_input_power", "total_output_power"))
+    return changed
+
+
+def apply_explicit_switch_sensor_overrides(decoded, cache=None):
+    changed = set()
+    cache = cache or {}
+
+    def set_zero(key):
+        if decoded.get(key) != 0:
+            changed.add(key)
+        decoded[key] = 0
+
+    # The TSL switch state is authoritative. Some frames keep reporting a tiny
+    # phantom dc_output_power (observed 4 W) while the app and TSL say DC is off.
+    dc_is_off = decoded.get("dc_switch") is False or (
+        "dc_switch" not in decoded and cache.get("dc_switch") is False
+    )
+    if dc_is_off:
+        for key in DC_OUTPUT_SENSOR_KEYS:
+            set_zero(key)
+    return changed
+
+# ---- end restored helpers ----
 
 def run(args):
     availability_topic = f"{args.topic}/availability"
@@ -2438,7 +3554,9 @@ def run(args):
         will_retain=True,
     )
     mqtt.connect()
-    print(f"MQTT connected; publishing discovery...", flush=True)
+    # Connessione MQTT dedicata alle prese (Last Will separato dalla powerstation).
+    args._socket_liveness = _start_socket_liveness(args)
+    print("MQTT connected; publishing discovery...", flush=True)
     publish_discovery(mqtt, args.topic, args)
     subscribe_command_topics(mqtt, args.topic, args)
 
@@ -2447,6 +3565,7 @@ def run(args):
     cleanup_disabled_cache_files(args)
 
     sensor_cache: dict = {}
+    next_smart_socket_poll = 0.0
 
     reconnect_delay = RECONNECT_DELAY_INIT
     unreachable_since: float | None = None
@@ -2457,6 +3576,8 @@ def run(args):
     sensor_silence_since: float | None = None
     session_had_sensor_data = False  # questa sessione TCP ha ricevuto almeno un dato
     last_wifi_frozen_alert = 0.0
+    unreachable_alert_streak = 0    # alert LAN unreachable consecutivi
+    first_alert_at_episode = None   # timestamp del primo alert pubblicato in questo episodio di freeze
 
     try:
         while True:
@@ -2468,11 +3589,11 @@ def run(args):
                     args.device_host, args.device_port, args.key,
                     float(getattr(args, "timeout", 10) or 10),
                 )
-
                 # ── Connected ────────────────────────────────────────────────
                 if lan_disconnected_since is not None:
                     print(f"LAN recovered after {time.time() - lan_disconnected_since:.0f}s", flush=True)
                 unreachable_since = None
+                unreachable_alert_streak = 0
                 # broken_pipe_since NON viene resettato qui: il TCP connect può
                 # riuscire e poi dare subito Broken pipe (firmware non pronto).
                 # Viene resettato solo quando arrivano dati sensori reali.
@@ -2482,22 +3603,42 @@ def run(args):
                 session_had_sensor_data = False
                 # Reset stato pendente dalla sessione precedente (Bug 2 fix):
                 # evita comandi indesiderati su device appena riconnesso
-                args._grid_fault_recovery   = False
-                args._grid_retrigger_on_due = 0
                 args._pending_output_power  = None
                 args._pending_output_power_due = 0
                 args._next_bus_kick         = 0
-                args._fault_recovery_count  = 0  # contatore retrigger E02 per sessione
                 args._cmd_grace_until       = 0  # reset grace period su riconnessione
-
                 mqtt.publish(availability_topic, "online", retain=True)
                 print(f"LAN connected; MQTT at {args.mqtt_host}:{args.mqtt_port}", flush=True)
 
                 args._lan_packet_id = 1
                 time.sleep(1.0)  # grace period post-login prima dei comandi
                 send_report_subscription(sock, key, iv, args)
-                send_bus_mask(sock, key, iv, args)
-                send_bus_refresh(sock, key, iv, args)          # modalità alta frequenza
+                sent_mask_ids = resolve_bus_mask_ids(args)
+                send_bus_mask(sock, key, iv, args, ids=sent_mask_ids)
+                send_bus_refresh(sock, key, iv, args)          # sollecito reporting
+                last_bus_refresh_sent = time.time()
+
+                # ── Nudge LAN+WiFi High Frequency Reporting al login ───────────
+                # Invio singolo (non ripetuto) per provare a far partire la sessione
+                # in modalità alta frequenza, invece di aspettare che il device la
+                # scelga da solo. Valore 3 = LAN + Wi-Fi (verificato empiricamente:
+                # il valore 1 "solo LAN" è un no-op su questo firmware, non sveglia
+                # il device — solo 3 lo stimola davvero). Non viene mai re-inviato
+                # durante la sessione anche se il device torna in Low da solo (per
+                # non rincorrerlo).
+                try:
+                    _hfr_catalog = getattr(args, "_tsl_select_catalog", {}) or {}
+                    _hfr_info = _hfr_catalog.get("high_frequency_reporting")
+                    if _hfr_info:
+                        _hfr_frame = _build_tsl_info_frame(
+                            _hfr_info, 3, key, iv, args, default_type="ENUM"
+                        )
+                        _send_frame(sock, args, _hfr_frame)
+                        _dprint("sent high_frequency_reporting=3 (LAN+WiFi) one-shot al login", flush=True)
+                    else:
+                        _dprint("high_frequency_reporting non trovato nel select catalog: nudge saltato", flush=True)
+                except Exception as _hfr_exc:
+                    _dprint(f"high_frequency_reporting nudge fallito: {_hfr_exc}", flush=True)
 
                 # ── Drain comandi MQTT stantii ────────────────────────────────
                 # Il broker MQTT mantiene la connessione attiva durante i disconnect
@@ -2523,8 +3664,7 @@ def run(args):
                 last_sensor_rx = now
                 next_resubscribe  = now + REPORT_RESUBSCRIBE if REPORT_RESUBSCRIBE > 0 else 0
                 next_bus_mask     = now + BUS_MASK_INTERVAL if BUS_MASK_INTERVAL > 0 else 0
-                startup_primer_subscribe_sent = False
-                startup_primer_mask_sent = False
+                last_bus_refresh_sent = now  # debounce: evita invii bus_mask/bus_refresh troppo ravvicinati
                 recv_buf = b""
 
                 while True:
@@ -2542,37 +3682,7 @@ def run(args):
                     # Non riconnettiamo durante la grace per evitare di triggerare automazioni HA.
                     _grace_until = getattr(args, "_cmd_grace_until", 0) or 0
                     sensor_silence = now - last_sensor_rx
-                    if (
-                        not session_had_sensor_data
-                        and sensor_silence >= STARTUP_PRIMER_SUBSCRIBE_AFTER
-                        and not startup_primer_subscribe_sent
-                        and now >= _grace_until
-                    ):
-                        print(
-                            f"startup no sensor data for {sensor_silence:.0f}s — primer report subscription",
-                            flush=True,
-                        )
-                        send_report_subscription(sock, key, iv, args)
-                        startup_primer_subscribe_sent = True
-                    elif (
-                        not session_had_sensor_data
-                        and sensor_silence >= STARTUP_PRIMER_MASK_AFTER
-                        and not startup_primer_mask_sent
-                        and now >= _grace_until
-                    ):
-                        print(
-                            f"startup no sensor data for {sensor_silence:.0f}s — primer refresh",
-                            flush=True,
-                        )
-                        # Sessione muta: forziamo refresh + full mask, non ids=2.
-                        # Il log reale 0.3.74 mostra che solo il refresh non sblocca
-                        # sempre la powerstation quando la sessione nasce senza sensori.
-                        send_bus_refresh(sock, key, iv, args)
-                        send_bus_mask(sock, key, iv, args)
-                        next_bus_mask = now + BUS_MASK_INTERVAL if BUS_MASK_INTERVAL > 0 else 0
-                        startup_primer_mask_sent = True
-
-                    if sensor_silence >= SENSOR_RECONNECT_AFTER and now >= _grace_until:
+                    if args.freeze_detection_enabled and sensor_silence >= SENSOR_RECONNECT_AFTER and now >= _grace_until:
                         raise RuntimeError(
                             f"no sensor data for {now - last_sensor_rx:.0f}s — reconnecting"
                         )
@@ -2585,6 +3695,18 @@ def run(args):
                         mqtt.ping()
                         last_mqtt_ping = now
 
+                    if getattr(args, "smart_sockets_enabled", True) and now >= next_smart_socket_poll:
+                        _poll_smart_sockets(mqtt, args.topic, args)
+                        requested_interval = int(getattr(args, "smart_socket_poll_interval", 20) or 20)
+                        if requested_interval < 10 and not getattr(args, "_smart_socket_poll_warned", False):
+                            print(
+                                "smart_socket_poll_interval below 10s: clamped to 10s",
+                                flush=True,
+                            )
+                            args._smart_socket_poll_warned = True
+                        interval = max(10, requested_interval)
+                        next_smart_socket_poll = now + interval
+
                     # Rinnova subscription: il device la dimentica se resta senza richiami.
                     # Anche durante il silenzio sensori continuiamo, come nel bridge 0.3.55:
                     # se blocchiamo questi richiami, la LAN resta ferma fino al recovery.
@@ -2592,16 +3714,24 @@ def run(args):
                         send_report_subscription(sock, key, iv, args)
                         next_resubscribe = now + REPORT_RESUBSCRIBE
 
-                    # Logica veloce 0.2.7: richiedi sempre la mask completa e poi
-                    # risveglia il bus. Niente ids=2: full mask = tutti i sensori.
                     if BUS_MASK_INTERVAL > 0 and now >= next_bus_mask:
-                        send_bus_mask(sock, key, iv, args)
-                        send_bus_refresh(sock, key, iv, args)
+                        if now - last_bus_refresh_sent >= BUS_REFRESH_MIN_GAP:
+                            send_bus_mask(sock, key, iv, args)
+                            send_bus_refresh(sock, key, iv, args)
+                            last_bus_refresh_sent = now
+                        else:
+                            _dprint(
+                                f"bus_mask/bus_refresh periodico soppresso "
+                                f"(debounce, {now - last_bus_refresh_sent:.1f}s fa)",
+                                flush=True,
+                            )
                         next_bus_mask = now + BUS_MASK_INTERVAL
 
                     for topic, payload, retained in mqtt.read_messages():
                         if retained:
                             _dprint(f"ignored retained MQTT command: {topic}={payload}", flush=True)
+                            continue
+                        if _handle_smart_socket_command(topic, payload, mqtt, args.topic, args):
                             continue
                         if not session_had_sensor_data:
                             print(f"command dropped (no sensor data yet): {topic}={payload}", flush=True)
@@ -2611,30 +3741,20 @@ def run(args):
                     if session_had_sensor_data:   # Bug 3 fix
                         _flush_pending_output_power(sock, mqtt, args.topic, key, iv, args)
 
-                    # ── Grid retrigger after fault recovery ───────────────────
-                    if getattr(args, "_grid_fault_recovery", False):
-                        args._grid_fault_recovery = False
-                        frame = _build_tsl_info_frame(SWITCH_HEX["grid"], False, key, iv, args, default_type="BOOL")
-                        _send_frame(sock, args, frame)
-                        mqtt.publish(f"{args.topic}/cmd_state/grid", "OFF", retain=True)
-                        print("grid OFF (fault recovery — retrigger)", flush=True)
-                        args._grid_retrigger_on_due = time.time() + 2.0
-
-                    retrigger_due = getattr(args, "_grid_retrigger_on_due", 0) or 0
-                    if retrigger_due and now >= retrigger_due:
-                        args._grid_retrigger_on_due = 0
-                        frame = _build_tsl_info_frame(SWITCH_HEX["grid"], True, key, iv, args, default_type="BOOL")
-                        _send_frame(sock, args, frame)
-                        mqtt.publish(f"{args.topic}/cmd_state/grid", "ON", retain=True)
-                        print("grid ON (fault recovery — retrigger)", flush=True)
-                        args._next_bus_kick = time.time() + 2.0
-
                     kick_due = getattr(args, "_next_bus_kick", 0) or 0
                     if kick_due and now >= kick_due:
                         # Dopo ogni comando: bus_refresh + bus_mask completa (ids=31).
                         # Mantiene tutti i sensori attivi senza restringere la mask a batteria/base.
-                        send_bus_refresh(sock, key, iv, args)
-                        send_bus_mask(sock, key, iv, args)
+                        if now - last_bus_refresh_sent >= BUS_REFRESH_MIN_GAP:
+                            send_bus_refresh(sock, key, iv, args)
+                            send_bus_mask(sock, key, iv, args)
+                            last_bus_refresh_sent = now
+                        else:
+                            _dprint(
+                                f"bus_mask/bus_refresh post-comando soppresso "
+                                f"(debounce, {now - last_bus_refresh_sent:.1f}s fa)",
+                                flush=True,
+                            )
                         args._next_bus_kick = 0
                         next_bus_mask = now + BUS_MASK_INTERVAL if BUS_MASK_INTERVAL > 0 else 0
 
@@ -2647,16 +3767,20 @@ def run(args):
                     if not recv_buf:
                         continue
 
-                    frames = list(iter_frames(recv_buf))
-                    if frames:
-                        last_aa = recv_buf.rfind(b"\xaa\xaa")
-                        recv_buf = recv_buf[last_aa:] if last_aa > 0 else b""
-                    elif len(recv_buf) > 8192:
+                    frames, recv_buf = extract_frames(recv_buf)
+                    if not frames and len(recv_buf) > 8192:
                         print(f"LAN recv buffer discarded ({len(recv_buf)} bytes without frame)", flush=True)
                         recv_buf = b""
 
                     for frame in frames:
-                        raw_payload = frame["payload"]
+                        raw_payload = frame.get("payload", b"")
+                        if not frame.get("checksum_ok"):
+                            _dprint(
+                                f"ignored LAN frame with bad checksum: "
+                                f"cmd={frame.get('cmd')} packet={frame.get('packet_id')}",
+                                flush=True,
+                            )
+                            continue
                         if not raw_payload or len(raw_payload) % 16:
                             continue
                         try:
@@ -2677,13 +3801,19 @@ def run(args):
                                 args,
                             )
 
+                        charge_power = _extract_intelligent_charging_power(plain)
+                        if charge_power is not None and _command_state_allowed(
+                            args, INTELLIGENT_CHARGING_POWER_ID, str(charge_power)
+                        ):
+                            mqtt.publish(
+                                f"{args.topic}/cmd_state/{INTELLIGENT_CHARGING_POWER_ID}",
+                                str(charge_power),
+                                retain=True,
+                            )
+
                         decoded = decode_bus_payload(plain)
-                        # The TSL-driven walker now runs alongside the legacy decoder
-                        # by default. It fills in fields the reverse-engineered patterns
-                        # don't know about (e.g. mode, power_retention_set, smart_socket_mode,
-                        # explicit ac_switch/dc_switch state, plus any new model's
-                        # properties). The legacy decoder still wins for keys both produce
-                        # — only fields walker discovers that the legacy missed are added.
+                        # TSL-driven walker: integra i campi ricavati dal TSL che
+                        # il decoder principale non espone direttamente.
                         try:
                             from landbook_ttlv_walker import decode_payload as _ttlv_decode
                             walker_out = _ttlv_decode(plain) or {}
@@ -2691,11 +3821,8 @@ def run(args):
                             walker_out = {}
                             print(f"ttlv walker error: {_exc}", flush=True)
                         if walker_out:
-                            # Codes the legacy decoder already publishes as
-                            # human-readable labels (FAULT_CODE_LABELS,
-                            # DEVICE_STATUS_LABELS, mode select…). Letting the
-                            # walker overwrite them with raw ints would make HA
-                            # oscillate between "Normale" and "0".
+                            # Non sovrascrivere campi già normalizzati in etichette
+                            # leggibili, altrimenti HA oscillerebbe tra label e valore raw.
                             _LABELED_BY_LEGACY = {
                                 "fault_code", "fault_code_raw",
                                 "device_status", "device_status_raw",
@@ -2707,8 +3834,20 @@ def run(args):
                                 if k in _LABELED_BY_LEGACY:
                                     continue
                                 decoded[k] = v
+                            # Alcuni codici (es. led_status_set) vengono riportati dal
+                            # firmware in modo incoerente tra il frame "work_profile"
+                            # completo e i frame brevi solo-batteria: nello stesso ciclo
+                            # di polling l'uno dice ON, l'altro OFF. Per questi codici
+                            # ci fidiamo solo del frame work_profile (quello che il
+                            # firmware aggiorna in modo affidabile dopo un comando) e
+                            # ignoriamo il valore quando arriva da un frame senza
+                            # work_profile, invece di pubblicare ogni lettura e far
+                            # sfarfallare l'entità HA tra i due stati.
+                            _has_work_profile = "work_profile" in decoded
                             for _code in SWITCH_HEX:
                                 if _code not in walker_out:
+                                    continue
+                                if _code in FRAME_COHERENCE_REQUIRES_WORK_PROFILE and not _has_work_profile:
                                     continue
                                 _state = "ON" if bool(walker_out[_code]) else "OFF"
                                 if _command_state_allowed(args, _code, _state):
@@ -2717,15 +3856,25 @@ def run(args):
                             # exposed as a HA select entity, then publish them as
                             # the entity state so HA shows the human-readable
                             # option (e.g. led_status_set=3 → "SOS").
+                            #
+                            # The TTLV wire format encodes "integer 0" and "bool
+                            # false" with the same compact tag (and "integer 1"
+                            # can collapse onto "bool true" too) — the firmware
+                            # picks whichever encoding is shortest. So a BOOL
+                            # value here isn't actually ambiguous: it's always
+                            # literal index 0 (False) or 1 (True), regardless of
+                            # how many options the ENUM has. Translate before
+                            # the label lookup instead of discarding it.
                             _select_cat = getattr(args, "_tsl_select_catalog", {}) or {}
                             for _code, _info in _select_cat.items():
                                 if _code not in walker_out:
                                     continue
+                                if _code in FRAME_COHERENCE_REQUIRES_WORK_PROFILE and not _has_work_profile:
+                                    continue
                                 _opts = _info.get("options") or {}
                                 _raw = walker_out[_code]
-                                if isinstance(_raw, bool) and len(_opts) > 2:
-                                    _dprint(f"ignored ambiguous bool {_code}={_raw} for multi-option ENUM", flush=True)
-                                    continue
+                                if isinstance(_raw, bool):
+                                    _raw = 1 if _raw else 0
                                 try:
                                     _label = _opts.get(int(_raw))
                                 except (TypeError, ValueError):
@@ -2734,21 +3883,48 @@ def run(args):
                                     mqtt.publish(f"{args.topic}/cmd_state/{_code}", _label, retain=True)
                             _number_cat = getattr(args, "_tsl_number_catalog", {}) or {}
                             for _code in _number_cat:
-                                if _code in walker_out and _command_state_allowed(args, _code, str(walker_out[_code])):
-                                    mqtt.publish(f"{args.topic}/cmd_state/{_code}", str(walker_out[_code]), retain=True)
-                            if getattr(args, "use_ttlv_walker", False):
-                                # Diagnostic shadow publish when explicitly enabled.
-                                _publish_walker_shadow(mqtt, args.topic, walker_out, decoded)
+                                if _code not in walker_out:
+                                    continue
+                                _nval = walker_out[_code]
+                                # output_power_set can arrive as the TSL raw x10 value
+                                # (e.g. 1000 for 100 W). Never publish it out of the HA
+                                # number range, or HA logs "Invalid value ... (range ...)".
+                                if _code == "output_power_set":
+                                    _nval = _normalize_output_power_state_value(_nval)
+                                    if _nval is None:
+                                        continue
+                                if _command_state_allowed(args, _code, str(_nval)):
+                                    mqtt.publish(f"{args.topic}/cmd_state/{_code}", str(_nval), retain=True)
                         if decoded:
                             decoded.pop("high_frequency_reporting", None)
                             if not args.show_firmware_sensors:
                                 decoded = {k: v for k, v in decoded.items() if k not in FIRMWARE_SENSOR_IDS}
                             if decoded:
-                                meaningful_sensor_data = _has_meaningful_sensor_data(decoded)
+                                meaningful_sensor_data = _has_meaningful_sensor_data(decoded, args)
                                 if meaningful_sensor_data:
                                     last_sensor_rx = time.time()
+                                    if "hmi_field1_raw" in decoded:
+                                        args._last_field1_seen = decoded["hmi_field1_raw"]
+                                    if "hmi_field2_uptime_candidate" in decoded:
+                                        _new_uptime = decoded["hmi_field2_uptime_candidate"]
+                                        _prev_uptime = getattr(args, "_last_uptime_seen", None)
+                                        if _prev_uptime is not None and _new_uptime < _prev_uptime:
+                                            print(
+                                                f"hmi_field2_uptime_candidate è SCESO ({_prev_uptime} -> {_new_uptime}): "
+                                                "possibile riavvio interno del device, non solo un freeze del reporting",
+                                                flush=True,
+                                            )
+                                        args._last_uptime_seen = _new_uptime
+                                    if sensor_silence_since is not None:
+                                        print(
+                                            f"freeze terminato dopo {last_sensor_rx - sensor_silence_since:.0f}s "
+                                            f"(hmi_field1={getattr(args, '_last_field1_seen', '?')}, "
+                                            f"hmi_field2_uptime_candidate={getattr(args, '_last_uptime_seen', '?')})",
+                                            flush=True,
+                                        )
                                     sensor_silence_since = None
                                     sensor_silence_streak = 0
+                                    first_alert_at_episode = None
                                     args._cmd_grace_until = 0   # dati arrivati → grace non più necessaria
                                     if not session_had_sensor_data:
                                         session_had_sensor_data = True
@@ -2771,40 +3947,12 @@ def run(args):
                                 decoded.update(zero_values)
                             suppress_transient_ac_zeros(sensor_cache, decoded, args)
 
-                            # ── Auto-recovery: E02 cleared in Micro-Inverter mode ────────────
-                            # SOLO per E02: spina non inserita → micro-inverter attivato.
-                            # Quando la spina viene attaccata l'E02 torna Normale ma il
-                            # micro-inverter non riparte: serve grid OFF → grid ON per sbloccare.
-                            # ATTENZIONE: NON attivare per altri fault (es. E40, E01…):
-                            # il retrigger peggiorerebbe un fault già attivo causando un loop.
-                            if "fault_code" in decoded:
-                                prev_fault = sensor_cache.get("fault_code")
-                                curr_fault = decoded["fault_code"]
-                                if (prev_fault == "Errore E02"   # solo E02, non altri fault
-                                        and curr_fault == "Normale"):
-                                    sw = load_switch_cache()
-                                    if sw.get("mode") == "Micro-Inverter" and sw.get("grid") == "ON":
-                                        count = int(getattr(args, "_fault_recovery_count", 0) or 0)
-                                        if count < FAULT_RECOVERY_MAX:
-                                            args._fault_recovery_count = count + 1
-                                            print(
-                                                f"E02 cleared → Normale in Micro-Inverter — "
-                                                f"grid retrigger programmato "
-                                                f"({args._fault_recovery_count}/{FAULT_RECOVERY_MAX})",
-                                                flush=True,
-                                            )
-                                            args._grid_fault_recovery = True
-                                        else:
-                                            print(
-                                                f"E02 cleared ma max retrigger raggiunto "
-                                                f"({FAULT_RECOVERY_MAX}) — skip, riavvio manuale necessario",
-                                                flush=True,
-                                            )
-
+                            remaining_frame_keys = normalize_remaining_time_from_frame(decoded, sensor_cache)
                             guard_zero_remaining_time(decoded, sensor_cache)
                             explicit_override_keys = apply_explicit_switch_sensor_overrides(decoded, sensor_cache)
                             sensor_cache.update(decoded)
                             publish_keys = set(decoded)
+                            publish_keys.update(remaining_frame_keys)
                             publish_keys.update(alias_keys)
                             publish_keys.update(zero_baseline_keys)
                             publish_keys.update(cell_voltage_keys)
@@ -2819,9 +3967,6 @@ def run(args):
                             publish_keys.update(apply_battery_power_balance(sensor_cache, decoded, args))
                             publish_keys.update(apply_device_status_correction(sensor_cache, decoded))
                             publish_keys.update(apply_raw_status_labels(sensor_cache, decoded))
-                            publish_keys.update(apply_battery_soc_tracking(sensor_cache, decoded, args))
-                            publish_keys.update(apply_battery_remaining_time_estimate(sensor_cache, args, decoded))
-                            save_battery_cache(sensor_cache, decoded, args)
                             sensor_cache["updated_at"] = int(time.time())
                             publish_sensor_cache(mqtt, args.topic, sensor_cache, publish_keys, args)
                             if "output_power_set" in decoded:
@@ -2829,8 +3974,6 @@ def run(args):
                             publish_inferred_command_states(mqtt, args.topic, sensor_cache, decoded, args)
                             if decoded:
                                 debug_decoded = dict(decoded)
-                                if "device_status_raw" in debug_decoded:
-                                    debug_decoded["device_status_corrected"] = sensor_cache.get("device_status")
                                 _dprint(f"decoded: {debug_decoded}", flush=True)
 
                         reported = extract_reported_command_states(plain) if len(plain) <= 96 else {}
@@ -2842,6 +3985,20 @@ def run(args):
                             if override_keys:
                                 sensor_cache["updated_at"] = int(time.time())
                                 publish_sensor_cache(mqtt, args.topic, sensor_cache, override_keys, args)
+
+            except MqttConnectionError as exc:
+                print(f"MQTT error: {exc} — restarting bridge", flush=True)
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    sock = None
+                try:
+                    mqtt.disconnect()
+                except Exception:
+                    pass
+                _restart_process(args)
 
             except (OSError, RuntimeError) as exc:
                 now = time.time()
@@ -2858,8 +4015,22 @@ def run(args):
                 # Silenzio sensori per 60s mentre il TCP è vivo = WiFi freeze.
                 # Può accadere sia a inizio sessione (zombie puro) sia a metà
                 # sessione (freeze progressivo): contiamo entrambi i casi.
-                is_sensor_silence = "no sensor data" in exc_text
+                is_sensor_silence = (
+                    bool(getattr(args, "freeze_detection_enabled", True)) and
+                    ("no sensor data" in exc_text or "no frames" in exc_text)
+                )
                 exc_errno = getattr(exc, "errno", None)
+                reset_errnos = {getattr(errno, "ECONNRESET", 104), 10054}
+                reset_errnos.discard(None)
+                is_lan_reset = (
+                    exc_errno in reset_errnos or
+                    isinstance(exc, ConnectionResetError) or
+                    any(s in exc_text for s in (
+                        "connection reset by peer",
+                        "connection reset",
+                        "forcibly closed",
+                    ))
+                )
                 is_hard_unreachable = (
                     exc_errno in {errno.EHOSTUNREACH, errno.ENETUNREACH} or
                     any(s in exc_text for s in (
@@ -2867,7 +4038,6 @@ def run(args):
                         "network is unreachable",
                         "no route to host",
                         "timed out",
-                        "connection reset by peer",
                     ))
                 )
                 if is_sensor_silence:
@@ -2877,6 +4047,17 @@ def run(args):
                     # "wifi_frozen" non partiva mai. Ora contiamo entrambe le condizioni.
                     if sensor_silence_since is None:
                         sensor_silence_since = now
+                        _prev_freeze_start = getattr(args, "_last_freeze_start", None)
+                        _gap_txt = (
+                            f", {now - _prev_freeze_start:.0f}s dal freeze precedente"
+                            if _prev_freeze_start else ""
+                        )
+                        print(
+                            f"FREEZE START {time.strftime('%H:%M:%S', time.localtime(now))}"
+                            f" (uptime_candidate={getattr(args, '_last_uptime_seen', '?')}{_gap_txt})",
+                            flush=True,
+                        )
+                        args._last_freeze_start = now
                     sensor_silence_streak += 1
                     if not session_had_sensor_data:
                         print(
@@ -2891,8 +4072,10 @@ def run(args):
                             flush=True,
                         )
                     if sensor_silence_streak >= WIFI_FROZEN_ALERT_AFTER:
+                        about_to_stop = sensor_silence_streak >= WIFI_FROZEN_STOP_AFTER
                         alert_elapsed = now - last_wifi_frozen_alert
-                        if last_wifi_frozen_alert and alert_elapsed < WIFI_FROZEN_ALERT_COOLDOWN:
+                        if last_wifi_frozen_alert and alert_elapsed < WIFI_FROZEN_ALERT_COOLDOWN \
+                                and not about_to_stop:
                             print(
                                 f"MQTT wifi_frozen alert soppresso "
                                 f"(cooldown {WIFI_FROZEN_ALERT_COOLDOWN - alert_elapsed:.0f}s)",
@@ -2912,38 +4095,91 @@ def run(args):
                                     flush=True,
                                 )
                                 last_wifi_frozen_alert = now
+                                if first_alert_at_episode is None:
+                                    first_alert_at_episode = now
                             except Exception as me:
                                 print(f"MQTT wifi_frozen publish failed: {me}", flush=True)
+                    if sensor_silence_streak >= WIFI_FROZEN_STOP_AFTER:
+                        _since_first_alert = (
+                            now - first_alert_at_episode if first_alert_at_episode else 0.0
+                        )
+                        if first_alert_at_episode is not None and _since_first_alert < MIN_SECONDS_BEFORE_STOP:
+                            _dprint(
+                                f"Freeze streak={sensor_silence_streak} ma attendo ancora "
+                                f"{MIN_SECONDS_BEFORE_STOP - _since_first_alert:.0f}s "
+                                "(tempo per l'automazione di riavvio WiFi) prima di spegnere l'add-on",
+                                flush=True,
+                            )
+                        else:
+                            stop_addon_after_freeze(
+                                mqtt,
+                                availability_topic,
+                                args.topic,
+                                sensor_silence_streak,
+                                now - sensor_silence_since,
+                            )
+
                     if now - sensor_silence_since >= SENSOR_SILENCE_RESTART:
                         print(
                             f"Sensori assenti da {now - sensor_silence_since:.0f}s — availability offline e riavvio bridge",
                             flush=True,
                         )
                         try:
-                            mqtt.publish(availability_topic, "offline", retain=True)
+                            mqtt.publish_resilient(availability_topic, "offline", retain=True)
                             availability_offline_sent = True
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            print(f"MQTT availability offline publish failed: {exc}", flush=True)
                         try:
                             mqtt.disconnect()
                         except Exception:
                             pass
-                        os.execv(sys.executable, [sys.executable] + sys.argv)
+                        _restart_process(args)
                 else:
-                    # Errore diverso (broken pipe, host unreachable…) → streak azzerata
-                    if sensor_silence_streak > 0:
-                        print(f"WiFi freeze streak reset (era {sensor_silence_streak})", flush=True)
-                    sensor_silence_streak = 0
-                    sensor_silence_since = None
+                    # Un 'host unreachable' / 'timed out' / RST subito dopo un alert
+                    # wifi_frozen è l'effetto ATTESO dell'automazione HA che ha appena
+                    # spento il WiFi 2.4G del router per il recovery. Se in quel momento
+                    # azzeriamo lo streak, l'episodio di freeze non raggiunge mai
+                    # WIFI_FROZEN_STOP_AFTER: wifi_frozen viene ripubblicato ad OGNI ciclo
+                    # (~60-90s) all'infinito e l'automazione thrasha la WiFi di casa
+                    # (migliaia di toggle). Durante un episodio di freeze attivo NON
+                    # resettiamo su unreachable/reset: lo streak/episodio si azzera solo
+                    # quando tornano dati sensori reali (ramo di ricezione sopra).
+                    _in_freeze_episode = sensor_silence_since is not None
+                    _recovery_disconnect = is_hard_unreachable or is_lan_reset
+                    if _in_freeze_episode and _recovery_disconnect:
+                        _dprint(
+                            f"disconnessione attesa durante recovery freeze "
+                            f"(streak={sensor_silence_streak}) — episodio mantenuto, nessun reset",
+                            flush=True,
+                        )
+                    else:
+                        if sensor_silence_streak > 0:
+                            print(f"WiFi freeze streak reset (era {sensor_silence_streak})", flush=True)
+                        sensor_silence_streak = 0
+                        sensor_silence_since = None
 
                 if "mqtt disconnected" in exc_text:
                     print("MQTT disconnected - restarting bridge", flush=True)
-                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                    _restart_process(args)
+
+                if is_lan_reset:
+                    print("LAN RST ricevuto dalla powerstation; socket chiuso e riconnessione in corso", flush=True)
 
                 # Detect hard unreachability (WiFi/network down, not just device)
                 if is_hard_unreachable:
                     if unreachable_since is None:
                         unreachable_since = now
+                        _prev_unreachable_start = getattr(args, "_last_unreachable_start", None)
+                        _gap_txt = (
+                            f", {now - _prev_unreachable_start:.0f}s dall'unreachable precedente"
+                            if _prev_unreachable_start else ""
+                        )
+                        print(
+                            f"UNREACHABLE START {time.strftime('%H:%M:%S', time.localtime(now))}"
+                            f" (uptime_candidate={getattr(args, '_last_uptime_seen', '?')}{_gap_txt})",
+                            flush=True,
+                        )
+                        args._last_unreachable_start = now
                 else:
                     unreachable_since = None
 
@@ -2966,29 +4202,11 @@ def run(args):
                 if unreachable_since is not None:
                     unreachable_elapsed = now - unreachable_since
                     if unreachable_elapsed >= UNREACHABLE_WIFI_FROZEN_ALERT:
-                        alert_elapsed = now - last_wifi_frozen_alert
-                        if last_wifi_frozen_alert and alert_elapsed < WIFI_FROZEN_ALERT_COOLDOWN:
-                            _dprint(
-                                f"MQTT wifi_frozen unreachable alert soppresso "
-                                f"(cooldown {WIFI_FROZEN_ALERT_COOLDOWN - alert_elapsed:.0f}s)",
-                                flush=True,
-                            )
-                        else:
-                            try:
-                                publish_wifi_frozen_alert(
-                                    mqtt,
-                                    args.topic,
-                                    reason="lan_unreachable",
-                                    duration=unreachable_elapsed,
-                                )
-                                print(
-                                    f"MQTT wifi_frozen alert pubblicato "
-                                    f"(LAN unreachable {unreachable_elapsed:.0f}s)",
-                                    flush=True,
-                                )
-                                last_wifi_frozen_alert = now
-                            except Exception as me:
-                                print(f"MQTT wifi_frozen publish failed: {me}", flush=True)
+                        _dprint(
+                            f"LAN unreachable da {unreachable_elapsed:.0f}s: "
+                            "riconnessione in corso senza evento wifi_frozen",
+                            flush=True,
+                        )
 
                 # Restart the process if the network has been hard-unreachable too long
                 # (handles the case where the WiFi router takes >3 min to come back)
@@ -2998,7 +4216,7 @@ def run(args):
                         mqtt.disconnect()   # DISCONNECT pulito: il broker NON manda LWT "offline"
                     except Exception:
                         pass
-                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                    _restart_process(args)
 
                 # Restart the process if stuck in a broken-pipe loop
                 # (device firmware accepts TCP but drops connection after login;
@@ -3009,7 +4227,7 @@ def run(args):
                         mqtt.disconnect()   # DISCONNECT pulito: il broker NON manda LWT "offline"
                     except Exception:
                         pass
-                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                    _restart_process(args)
 
                 # Refresh LAN key on auth failure (unbind/rebind dall'app).
                 # The cached key is stale → wipe it before asking the cloud for a fresh one,
@@ -3029,25 +4247,25 @@ def run(args):
                 # Offline solo su hard-unreachable (rete giù) o su altri errori prolungati.
                 elapsed = now - lan_disconnected_since
                 if not availability_offline_sent and elapsed >= AVAILABILITY_HOLD \
-                        and not is_broken_pipe and not is_sensor_silence:
+                        and not is_broken_pipe and not is_sensor_silence and not is_lan_reset:
                     try:
-                        mqtt.publish(availability_topic, "offline", retain=True)
+                        mqtt.publish_resilient(availability_topic, "offline", retain=True)
                         availability_offline_sent = True
                         print(f"MQTT availability → offline after {elapsed:.0f}s outage", flush=True)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        print(f"MQTT availability offline publish failed: {exc}", flush=True)
 
                 # Wait, checking offline trigger every second during the delay
                 sleep_until = time.time() + reconnect_delay
                 while time.time() < sleep_until:
                     if not availability_offline_sent and lan_disconnected_since is not None \
-                            and not is_broken_pipe and not is_sensor_silence:
+                            and not is_broken_pipe and not is_sensor_silence and not is_lan_reset:
                         if time.time() - lan_disconnected_since >= AVAILABILITY_HOLD:
                             try:
-                                mqtt.publish(availability_topic, "offline", retain=True)
+                                mqtt.publish_resilient(availability_topic, "offline", retain=True)
                                 availability_offline_sent = True
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                print(f"MQTT availability offline publish failed: {exc}", flush=True)
                     time.sleep(min(1.0, max(0.0, sleep_until - time.time())))
 
                 reconnect_delay = min(reconnect_delay * 1.5, RECONNECT_DELAY_MAX)
@@ -3055,8 +4273,8 @@ def run(args):
     finally:
         try:
             mqtt.publish(availability_topic, "offline", retain=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"MQTT availability offline publish failed on exit: {exc}", flush=True)
         try:
             mqtt.disconnect()
         except Exception:
@@ -3068,8 +4286,8 @@ def run(args):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Landbook FPPT-T2400 LAN -> HA MQTT bridge (0.3.85)")
-    parser.add_argument("--device-host", default="192.168.1.65")
+    parser = argparse.ArgumentParser(description="Landbook/Wonderfree generic LAN -> HA MQTT bridge")
+    parser.add_argument("--device-host", default="")
     parser.add_argument("--device-port", type=int, default=6607)
     parser.add_argument("--key", required=True, help="LAN key (base64). Retrieved by addon_run.py from the cloud or local cache.")
     parser.add_argument("--mqtt-host", default="core-mosquitto")
@@ -3082,17 +4300,18 @@ def main():
     parser.add_argument("--report-interval", type=int, default=10)
     parser.add_argument("--battery-capacity-wh", type=float, default=2048)
     parser.add_argument("--battery-cache-path", default="/data/landbook_battery_cache.json")
-    parser.add_argument("--battery-discharge-usable-ratio", type=float, default=0.88)
     parser.add_argument("--battery-current-fallback-voltage", type=float, default=52.8)
-    parser.add_argument("--battery-soc-estimate", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--grid-frequency-default", type=float, default=50)
     parser.add_argument("--ac-zero-hold-seconds", type=float, default=18)
-    parser.add_argument("--sensor-expire-after", type=int, default=0)
-    parser.add_argument("--battery-info-expire-after", type=int, default=86400)
     parser.add_argument("--show-firmware-sensors", action="store_true", default=False)
-    parser.add_argument("--use-ttlv-walker", action="store_true", default=False,
-                        help="Shadow-publish the TSL-driven TTLV walker output to <topic>/sensors_v2/<code> "
-                             "alongside the legacy decoder, for offline comparison.")
+    parser.add_argument("--smart-sockets-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--smart-socket-poll-interval", type=int, default=20)
+    parser.add_argument("--smart-socket-1-device-key", default="")
+    parser.add_argument("--smart-socket-1-product-key", default="")
+    parser.add_argument("--smart-socket-1-name", default="")
+    parser.add_argument("--smart-socket-2-device-key", default="")
+    parser.add_argument("--smart-socket-2-product-key", default="")
+    parser.add_argument("--smart-socket-2-name", default="")
     parser.add_argument("--output-power-min", type=int, default=100)
     parser.add_argument("--output-power-max", type=int, default=800)
     parser.add_argument("--output-power-step", type=int, default=10)
@@ -3101,6 +4320,15 @@ def main():
     parser.add_argument("--command-duplicate-window", type=float, default=COMMAND_DUPLICATE_WINDOW)
     parser.add_argument("--command-opposite-window", type=float, default=COMMAND_OPPOSITE_WINDOW)
     parser.add_argument("--mqtt-stale-drain-seconds", type=float, default=2.0)
+    parser.add_argument(
+        "--freeze-detection-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Se False, disabilita la riconnessione automatica per 'silenzio sensori' "
+             "(SENSOR_RECONNECT_AFTER) — utile per testare se il ciclo naturale Low/LAN+WiFi "
+             "del device viene scambiato per un freeze reale. Non tocca il controllo 'no frames' "
+             "(LAN davvero morta), che resta sempre attivo. Default True = comportamento invariato.",
+    )
     args = parser.parse_args()
     print(f"Landbook LAN MQTT Bridge {APP_VERSION} starting", flush=True)
     run(args)
@@ -3108,5 +4336,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
