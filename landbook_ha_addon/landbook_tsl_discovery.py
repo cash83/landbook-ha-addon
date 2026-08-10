@@ -187,7 +187,9 @@ def load_bundle(path: str = TSL_DUMP_PATH) -> dict:
 
 # Codes the bridge intentionally hides from HA discovery: handled via dedicated
 # entities (output_power slider) or business-logic post-processing.
-HIDDEN_CONTROL_CODES = set()
+# - quec_x_clear_data = "Restore factory settings": comando distruttivo, non deve
+#   esistere come entità in HA (un tocco accidentale resetterebbe la powerstation).
+HIDDEN_CONTROL_CODES = {"quec_x_clear_data"}
 
 
 def get_switches() -> List[dict]:
@@ -457,6 +459,8 @@ RETAINED_SWITCH_CLEANUP = [
     "measure_data",
     "ac_switch", "dc_switch", "grid_power_switch_set",
     "beep_setting_set", "ac_charging_limit_set",
+    # "Restore factory settings" (id 47): comando distruttivo, rimosso da HA.
+    "quec_x_clear_data",
     # Any direct duplicate of the baseline internal names was published as a
     # separate switch in 0.3.86-first-run; clean them up.
 ]

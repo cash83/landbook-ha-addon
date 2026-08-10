@@ -228,6 +228,11 @@ def decode_payload(payload: bytes, schema: Optional[dict] = None) -> Dict[str, A
             continue
         if typ == TYPE_STRUCT and isinstance(val, list):
             _decode_struct(val, entry, out)
+        elif str(entry.get("type") or "").upper() == "STRUCT":
+            # Id STRUCT arrivato con valore scalare: struct vuoto/keepalive del
+            # firmware (es. pv_data:0 in standby) oppure eco spurio. Mai un dato
+            # reale → scartato alla sorgente.
+            pass
         else:
             out[entry["code"]] = _apply_scale(val, entry)
         pos = new_pos

@@ -5,6 +5,7 @@ import os
 import socket
 import shutil
 import sys
+import time
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
 log = logging.getLogger("addon_run")
@@ -135,34 +136,43 @@ def add_arg(args, name, value):
 
 
 def run_autodiscovery(options, force_cloud: bool = False):
-    """Populate options["key"] and env vars from the cache or, as fallback, the cloud.
+    """Populate options["key"] and env vars from local cache first.
 
-    Set force_cloud=True to bypass the local cache (used when LAN login fails with
-    auth errors, suggesting the cached key is stale).
+    Normal boots use the cached LAN key + TSL without contacting the cloud.
+    Cloud is used only to bootstrap or refresh those local LAN credentials/schema;
+    telemetry and command states still come only from LAN frames.
     """
     email    = str(options.get("wf_email", "")).strip()
     password = str(options.get("wf_password", "")).strip()
-    if not email or not password:
-        raise SystemExit("wf_email/wf_password obbligatori: la LAN key deve essere scoperta dal cloud")
+    if not email:
+        raise SystemExit("wf_email obbligatorio per validare la cache LAN locale")
     platform = str(options.get("app", "landbook")).strip().lower()
     os.environ["WF_EMAIL"]    = email
     os.environ["WF_PASSWORD"] = password
     os.environ["PLATFORM"]    = platform
     cached = {} if force_cloud else load_cached_lan_key(email, platform)
-    smart_sockets_enabled = bool(options.get("smart_sockets_enabled", True))
+
+    if not password:
+        if not force_cloud and cached and _tsl_dump_is_fresh():
+            log.info(f"Powerstation: LAN key e TSL in cache locale ({LAN_KEY_CACHE_PATH}) — bootstrap cloud non necessario")
+            apply_cached_lan_key(options, cached)
+            os.environ["LANDBOOK_CLOUD_BOOTSTRAP_ONLY"] = "1"
+            return
+        raise SystemExit("wf_password obbligatoria solo se serve recuperare LAN key/TSL dal cloud")
+
+    if not force_cloud and cached and _tsl_dump_is_fresh():
+        log.info(f"Powerstation: LAN key e TSL in cache locale ({LAN_KEY_CACHE_PATH}) — bootstrap cloud non necessario")
+        apply_cached_lan_key(options, cached)
+        os.environ["LANDBOOK_CLOUD_BOOTSTRAP_ONLY"] = "1"
+        return
 
     if not force_cloud:
-        if cached and _tsl_dump_is_fresh() and not smart_sockets_enabled:
-            log.info(f"LAN key trovata in cache locale ({LAN_KEY_CACHE_PATH}) — cloud non contattato")
-            apply_cached_lan_key(options, cached)
-            return
-        if cached and _tsl_dump_is_fresh() and smart_sockets_enabled:
-            log.info("LAN key in cache: aggiorno comunque token/lista smart socket dal cloud")
-        if cached and not _tsl_dump_is_fresh():
-            log.info("LAN key in cache ma TSL dump obsoleto (parser version mismatch) — "
-                     "ricarico dal cloud per aggiornare lo schema")
+        if cached:
+            log.warning("Powerstation: TSL cache mancante/obsoleta; cloud usato solo per rigenerare TSL/LAN key locali")
+        else:
+            log.warning("Powerstation: LAN key cache assente; cloud usato solo per bootstrap LAN key/TSL locali")
 
-    log.info(f"Cloud login: platform={platform} user={email[:3]}***")
+    log.info(f"Powerstation bootstrap cloud login: platform={platform} user={email[:3]}***")
     try:
         from wf_autodiscovery import setup as autodiscovery_setup
         autodiscovery_setup(force=True)
@@ -204,13 +214,44 @@ logging.getLogger().setLevel({"debug": logging.DEBUG, "info": logging.INFO,
                                "warning": logging.WARNING, "error": logging.ERROR}.get(level_str, logging.INFO))
 log.info(f"Landbook LAN Bridge {APP_VERSION} — log level: {level_str.upper()}")
 
+# 0.10.6 — fuso orario del log.
+# Gli orari stampati dal bridge (FREEZE START / UNREACHABLE START) usano
+# time.localtime(). Il Supervisor NON passa la variabile TZ a questo add-on
+# (verificato: TZ non impostata), quindi senza questo blocco il container resta
+# su UTC e ogni ora nel log e' sfasata rispetto alla history di Home Assistant,
+# rendendo impossibile incrociare i due. L'opzione `timezone` (default
+# Europe/Rome) imposta TZ + time.tzset() per l'intero processo, bridge incluso.
+# Ordine: opzione dell'add-on (se lo store ne ha gia' recepito lo schema) →
+# ENV TZ → default. Il default e' nel codice e non solo nel Dockerfile perche'
+# ne' il Supervisor ne' l'ENV dell'immagine si sono dimostrati affidabili qui.
+# Se dopo questo il log stampa ancora UTC+0000, manca tzdata nell'immagine.
+_tz = (
+    str(options.get("timezone", "") or "").strip()
+    or os.environ.get("TZ", "").strip()
+    or "Europe/Rome"
+)
+if _tz:
+    os.environ["TZ"] = _tz
+    try:
+        time.tzset()
+    except AttributeError:
+        pass  # non-Unix: si resta sul fuso di default
+log.info(
+    "Fuso orario del log: %s (TZ=%s) — ora locale %s",
+    time.strftime("%Z%z"),
+    os.environ.get("TZ", "non impostata"),
+    time.strftime("%Y-%m-%d %H:%M:%S"),
+)
+
 run_autodiscovery(options)
 
 device_key = options.pop("_device_key", "") or str(options.get("device_key", "")).strip()
 topic = f"landbook/{device_key}" if device_key else "landbook/device"
 
-# La LAN key viene recuperata dal cloud, ma gli stati comandi non devono
-# arrivare dal cloud: devono seguire solo LAN o comandi Home Assistant.
+# La LAN key/TSL arrivano dalla cache locale; il cloud interviene solo per
+# bootstrap/refresh se la cache manca o la LAN key non è più valida.
+# Gli stati della powerstation non arrivano dal cloud: seguono solo LAN o
+# comandi Home Assistant. Le smart socket restano gestite dal loro worker separato.
 
 # Verify MQTT reachability
 try:
@@ -230,6 +271,8 @@ for key in ("device_host", "device_port", "mqtt_host", "mqtt_port",
     add_arg(cmd, key, options.get(key))
 add_arg(cmd, "freeze_detection_enabled", bool(options.get("freeze_detection_enabled", True)))
 add_arg(cmd, "smart_sockets_enabled", bool(options.get("smart_sockets_enabled", True)))
+add_arg(cmd, "clear_command_states_on_start",
+        bool(options.get("clear_command_states_on_start", True)))
 add_arg(cmd, "device_key", device_key)
 add_arg(cmd, "topic", topic)
 

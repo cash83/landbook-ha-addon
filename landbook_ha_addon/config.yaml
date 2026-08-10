@@ -1,5 +1,5 @@
 name: Landbook LAN MQTT Bridge
-version: "0.9.23"
+version: "0.10.8"
 slug: landbook_lan_mqtt_bridge
 description: "Landbook/Wonderfree LAN bridge: powerstation LAN con smart socket Wonderfree in HA."
 url: "https://github.com/cash83/landbook-ha-addon"
@@ -30,8 +30,10 @@ options:
   mqtt_password: ""
   battery_capacity_wh: 2048
   smart_sockets_enabled: true
-  smart_socket_poll_interval: 300
+  smart_socket_poll_interval: 30
   freeze_detection_enabled: true
+  clear_command_states_on_start: true
+  timezone: "Europe/Rome"
   log_level: "info"
 schema:
   wf_email: str
@@ -48,4 +50,6 @@ schema:
   smart_sockets_enabled: bool
   smart_socket_poll_interval: int
   freeze_detection_enabled: bool
+  clear_command_states_on_start: bool
+  timezone: str?
   log_level: list(debug|info|warning|error)
