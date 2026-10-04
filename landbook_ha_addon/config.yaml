@@ -1,5 +1,5 @@
 name: Landbook LAN MQTT Bridge
-version: "0.10.8"
+version: "0.13.0"
 slug: landbook_lan_mqtt_bridge
 description: "Landbook/Wonderfree LAN bridge: powerstation LAN con smart socket Wonderfree in HA."
 url: "https://github.com/cash83/landbook-ha-addon"
@@ -20,19 +20,32 @@ services:
 options:
   wf_email: ""
   wf_password: ""
-  app: "landbook"
+  app: "wonderfree"
   device_key: ""
   device_host: ""
   device_port: 6607
+  udp_scan_cidr: ""
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
   mqtt_user: ""
   mqtt_password: ""
+  topic_prefix: "landbook_test"
   battery_capacity_wh: 2048
   smart_sockets_enabled: true
   smart_socket_poll_interval: 30
+  smart_socket_1_device_key: ""
+  smart_socket_1_product_key: ""
+  smart_socket_1_name: ""
+  smart_socket_2_device_key: ""
+  smart_socket_2_product_key: ""
+  smart_socket_2_name: ""
+  read_interval: 10
+  rearm_interval: 20
+  hfr_mode: 1
+  frame_timeout: 30
   freeze_detection_enabled: true
-  clear_command_states_on_start: true
+  freeze_alert_after: 90
+  freeze_alert_cooldown: 50
   timezone: "Europe/Rome"
   log_level: "info"
 schema:
@@ -40,16 +53,29 @@ schema:
   wf_password: password
   app: list(wonderfree|landbook|landecia|northamerica|europe|china)
   device_key: str?
-  device_host: str
+  device_host: str?
   device_port: port
+  udp_scan_cidr: str
   mqtt_host: str
   mqtt_port: port
   mqtt_user: str?
   mqtt_password: password?
+  topic_prefix: str
   battery_capacity_wh: int
   smart_sockets_enabled: bool
   smart_socket_poll_interval: int
+  smart_socket_1_device_key: str?
+  smart_socket_1_product_key: str?
+  smart_socket_1_name: str?
+  smart_socket_2_device_key: str?
+  smart_socket_2_product_key: str?
+  smart_socket_2_name: str?
+  read_interval: int
+  rearm_interval: int
+  hfr_mode: int
+  frame_timeout: int
   freeze_detection_enabled: bool
-  clear_command_states_on_start: bool
+  freeze_alert_after: int(30,600)
+  freeze_alert_cooldown: int(10,600)
   timezone: str?
   log_level: list(debug|info|warning|error)

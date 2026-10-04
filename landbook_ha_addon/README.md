@@ -5,7 +5,7 @@ e per le **prese smart Wonderfree** associate allo stesso account.
 
 Powerstation e prese vivono nello **stesso add-on ma in modo indipendente**:
 
-- **Powerstation** → collegamento **LAN diretto** (protocollo TSL cifrato):
+- **Powerstation** → collegamento **LAN diretto** (protocollo TTLV cifrato AES):
   telemetria e comandi in tempo reale.
 - **Prese smart** → **cloud Wonderfree**: lettura stato e comando ON/OFF.
 
@@ -16,20 +16,26 @@ continuano a usare il cloud Wonderfree tramite il loro worker indipendente.
 
 ## Powerstation (LAN)
 
-- login LAN rapido e subscription telemetria ogni ~10 secondi;
-- `bus_mask` business + `bus_refresh` ogni ~10 secondi (debounce minimo 5s);
-- invio singolo di `high_frequency_reporting=3` (LAN + Wi-Fi) dopo ogni login;
-- riconnessione automatica se non arrivano frame entro ~30s o sensori entro ~50s
-  (la rilevazione per silenzio sensori è disattivabile; il controllo "no frames"
-  resta sempre attivo);
-- comandi da Home Assistant inviati via LAN usando il TSL.
+- scoperta del dispositivo via UDP broadcast sulla porta 6606, con ripiego
+  sull'ultimo indirizzo noto e su `device_host` se configurato;
+- login LAN con sfida/risposta SHA-256 sulla LAN key, poi heartbeat ogni
+  `read_interval` secondi;
+- lettura completa di tutti gli id del TSL ogni `read_interval` secondi e
+  ri-arming del reporting ad alta frequenza ogni `rearm_interval` secondi;
+- riconnessione automatica se non arrivano frame entro `frame_timeout` secondi,
+  o se la telemetria utile manca da `freeze_alert_after` secondi (90 di default);
+- comandi da Home Assistant inviati via LAN usando gli id del TSL.
 
-Entità pubblicate: batteria (SOC, tempo residuo, tensione, corrente, potenza,
-temperatura, singole celle), uscite AC/DC/USB/Type-C, rete, PV, potenze totali di
-ingresso/uscita, stato dispositivo e codice errore; controlli AC/DC out, on-grid,
-buzzer, LED, silent charge, working mode, power consumption plan, screen off time,
-SOC discharge, on-grid power setting, high frequency reporting e
-`Intelligent Charging Power` (200/400/600/800 W).
+Entità pubblicate: batteria (percentuale, energia residua, tempo residuo,
+tensione, corrente, potenza, temperatura, 13 tensioni di cella), uscite AC/DC
+12V/24V/USB/Type-C, rete, PV, potenze totali di ingresso e uscita, temperature
+di BMS, inverter e MPPT, stato dispositivo, codice guasto e stato della
+connessione LAN.
+
+Controlli: uscita AC, uscita DC, uscita on-grid, buzzer, LED, silent charge
+(6 switch); modalità di lavoro, SOC di scarica, spegnimento schermo, piano
+consumi (4 select); potenza on-grid (1 number). L'elenco esatto è letto dal TSL
+del dispositivo, quindi segue il modello e il firmware.
 
 ## Prese smart (cloud) — worker indipendente
 
@@ -44,50 +50,61 @@ Le prese sono gestite da un **worker dedicato con connessione MQTT propria**,
 Comportamento:
 
 - rilevate automaticamente dall'account (product key `p11sPk`); se il cloud non
-  ha ancora popolato la cache, fallback sulle device key indicate in configurazione;
+  ha ancora popolato la cache, ripiego sulle device key indicate in configurazione;
 - ogni presa è un **dispositivo separato ma agganciato alla powerstation**
   (`via_device` → `Landbook LAN Device`): in Home Assistant le prese appaiono
   raggruppate sotto la powerstation, pur restando device a sé;
 - entità per presa: switch ON/OFF, potenza, tensione, corrente, potenza apparente,
   fattore di potenza, energia; più un sensore `Smart socket total power`;
-- disponibilità doppia (bridge vivo **e** presa online sul cloud): se una presa
-  viene staccata, il cloud la marca offline e le sue entità diventano non
-  disponibili in Home Assistant;
+- disponibilità doppia (bridge vivo **e** presa online sul cloud): staccando una
+  presa dalla corrente le sue entità diventano non disponibili. Il ritardo è del
+  cloud, che aspetta la scadenza del proprio keepalive prima di dichiararla
+  caduta: misurati alcuni minuti, più al massimo un `smart_socket_poll_interval`;
 - comando ON/OFF inviato via MQTT cloud Wonderfree;
-- polling ogni `smart_socket_poll_interval` secondi (default 30, minimo 10),
-  indipendente dal runtime LAN.
+- una presa che non risponde non interrompe la lettura delle altre.
 
 ## Configurazione
 
 - `wf_email`, `wf_password`: credenziali app Landbook/Wonderfree.
 - `app`: piattaforma cloud (`wonderfree`, `landbook`, `landecia`, `northamerica`,
   `europe`, `china`).
-- `device_host`: IP della powerstation in LAN.
+- `device_key`: device key della powerstation, se ne hai più di una sull'account.
+- `device_host`: IP della powerstation in LAN (facoltativo: senza, la cerca via
+  UDP broadcast).
 - `device_port`: porta LAN, default `6607`.
+- `udp_scan_cidr`: sottorete da scandire quando il broadcast non basta
+  (es. `192.168.1.0/24`); al massimo 512 indirizzi.
 - `mqtt_host`, `mqtt_port`, `mqtt_user`, `mqtt_password`: broker MQTT.
+- `topic_prefix`: prefisso dei topic di servizio, default `landbook_test`. Le
+  entità di Home Assistant stanno comunque sotto `landbook/<device_key>/`.
 - `battery_capacity_wh`: capacità nominale batteria per i sensori derivati.
 - `smart_sockets_enabled`: abilita la pubblicazione delle prese smart associate.
 - `smart_socket_poll_interval`: secondi tra una lettura cloud e l'altra delle
   prese (default 30; valori sotto 10 vengono alzati automaticamente a 10).
-- `smart_socket_1_*` e `smart_socket_2_*`: fallback manuale (device key, product
+- `smart_socket_1_*` e `smart_socket_2_*`: ripiego manuale (device key, product
   key, nome) usato solo se il cloud non popola la lista prese.
-- `freeze_detection_enabled`: se `false`, disabilita la riconnessione automatica
-  per silenzio sensori (il controllo "no frames" resta sempre attivo).
-- `clear_command_states_on_start`: se `true` (default) all'avvio azzera gli stati
-  retained di select e number. Le entità restano `unknown` finché non è la LAN a
-  riportare il valore reale, così non viene mai mostrato un valore vecchio che
-  potrebbe essere cambiato mentre il bridge era fermo (dal pannello o dall'app).
-  Se `false`, conserva l'ultimo valore letto sulla LAN. In nessuno dei due casi
-  vengono usati i valori del cloud. Alcuni codici scendono dalla LAN di rado, per
-  cui con l'opzione attiva possono restare vuoti per un po' dopo un riavvio.
+- `read_interval`: secondi tra una lettura completa del TSL e la successiva
+  (default 10, minimo 5).
+- `rearm_interval`: secondi tra un ri-arming del reporting e il successivo
+  (default 20, minimo 10).
+- `hfr_mode`: reporting ad alta frequenza — `0` infrequente, `1` LAN (default),
+  `2` Wi-Fi, `3` LAN + Wi-Fi.
+- `frame_timeout`: secondi di silenzio totale dopo i quali la sessione LAN viene
+  ricreata (default 30, minimo 15).
+- `freeze_detection_enabled`: se `false`, disabilita l'allarme e la riconnessione
+  per telemetria ferma (il controllo "nessun frame" resta sempre attivo).
+- `freeze_alert_after`: secondi di telemetria ferma prima dell'allarme
+  `wifi_frozen` (default 90).
+- `freeze_alert_cooldown`: secondi minimi fra due allarmi (default 50).
+- `timezone`: fuso usato per gli orari del log, default `Europe/Rome`.
 - `log_level`: `debug`, `info`, `warning`, `error`.
 
 ## Cache
 
-- `/data/landbook_lan_key.json`: LAN key associata ad account e piattaforma.
+- `/data/test_powerstation_lan_key.json`: LAN key associata ad account e piattaforma.
+- `/data/test_powerstation_lan_host.json`: ultimo indirizzo LAN visto.
 - `/data/landbook_tsl.json`: TSL usato dal runtime.
-- `/data/discovered.json`: cache discovery cloud, incluse le prese smart associate.
-- `/share/landbook/`: copia leggibile del TSL (summary + raw) per controllo manuale.
+- `/share/landbook_tsl.json`: copia leggibile dello stesso TSL, per ispezione manuale.
 
 ## Evento `wifi_frozen`
 
@@ -101,25 +118,39 @@ Payload di esempio:
 
 ```json
 {
-  "reason": "lan_reset",
+  "reason": "sensor_silence",
   "ts": 1782690000,
-  "message": "PowerStation ha chiuso la connessione LAN con TCP RST. Il bridge si riconnette.",
+  "message": "PowerStation WiFi/LAN reporting frozen. Riavviare il WiFi del router o la powerstation.",
   "streak": 1,
-  "duration": 0
+  "duration": 95
 }
 ```
 
-Valori principali di `reason`:
+L'evento segnala che il dispositivo risponde ancora ma ha smesso di riportare la
+telemetria: su questi firmware lo sblocca un riavvio del Wi-Fi del router.
+Il bridge mantiene un cooldown tra alert ripetuti, regolabile con
+`freeze_alert_cooldown` (default 50 secondi).
 
-- `sensor_silence`: il TCP può essere vivo ma i sensori non arrivano più;
-- `lan_unreachable`: la powerstation non è raggiungibile in LAN per ~30s;
-- `lan_reset`: la powerstation ha chiuso il socket TCP con RST; il bridge si
-  riconnette e non lo considera da solo rete irraggiungibile.
+## Note sul protocollo, per chi mette le mani nel codice
 
-Il bridge mantiene un cooldown interno di ~50 secondi tra alert ripetuti.
+Tre trappole costate parecchio tempo, tutte verificate sul campo:
+
+- **I report arrivano in frame separati e parziali.** Un frame contiene solo
+  alcuni gruppi del TSL, quindi i valori derivati (le potenze totali) vanno
+  calcolati sulla cache unita, non sul singolo frame.
+- **Il frame di risposta alla lettura completa non valorizza il gruppo
+  `ac_data`.** È l'unico che contiene `mac_set`, e lì `ac_power` torna 0 anche
+  con 2,4 kW veri alle prese: quegli zeri vanno scartati prima di entrare in
+  cache. L'uscita AC buona arriva solo nel report spontaneo di `ac_data`.
+- **`ac_power` e `grid_b_power` sono due cose diverse**: il primo è l'uscita
+  delle prese AC (gruppo `ac_data`), il secondo è il micro inverter verso casa
+  (gruppo `grid_data`). Non devono sovrascriversi.
+
+Inoltre il TSL dichiara `step: 0.1` per `ac_voltage` e `bms_mos_temp`, ma il
+dispositivo manda volt e gradi interi: senza correzione si leggono 23 V invece
+di 230 V e un decimo della temperatura reale.
 
 ## Requisiti
 
 - broker MQTT (add-on Mosquitto o esterno);
-- `paho-mqtt` (già incluso nell'immagine dell'add-on) per il worker prese e il
-  comando cloud.
+- un account attivo nell'app ufficiale, con il dispositivo già registrato.

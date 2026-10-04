@@ -1,4 +1,4 @@
 #!/bin/sh
 set -eu
-echo "[Landbook add-on] booting..."
-exec python3 /app/addon_run.py
+echo "[Landbook LAN MQTT Bridge] booting..."
+exec python3 -u /app/test_powerstation.py

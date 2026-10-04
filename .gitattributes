@@ -1,0 +1,9 @@
+# run.sh e' l'entrypoint del container Alpine: con fini riga CRLF il kernel
+# legge "/bin/sh\r" e l'add-on non parte. Forzando LF, un clone su Windows
+# non puo' romperlo.
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+Dockerfile text eol=lf
