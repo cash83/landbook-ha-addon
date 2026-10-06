@@ -21,8 +21,26 @@ import paho.mqtt.client as mqtt
 
 
 OPTIONS_PATH = "/data/options.json"
-KEY_CACHE_PATH = "/data/test_powerstation_lan_key.json"
-HOST_CACHE_PATH = "/data/test_powerstation_lan_host.json"
+KEY_CACHE_PATH = "/data/landbook_lan_key.json"
+HOST_CACHE_PATH = "/data/landbook_lan_host.json"
+# Written under the old development name; renamed on first start so the cached
+# LAN key survives and the cloud login is not needed again.
+LEGACY_STATE_PATHS = {
+    KEY_CACHE_PATH: "/data/test_powerstation_lan_key.json",
+    HOST_CACHE_PATH: "/data/test_powerstation_lan_host.json",
+}
+
+
+def migrate_legacy_state() -> None:
+    for current, legacy in LEGACY_STATE_PATHS.items():
+        if os.path.exists(current) or not os.path.exists(legacy):
+            continue
+        try:
+            os.replace(legacy, current)
+        except OSError as exc:
+            log(f"could not rename {legacy}: {exc}", "warning")
+        else:
+            log(f"state file renamed: {legacy} -> {current}")
 TSL_DATA_PATH = "/data/landbook_tsl.json"
 TSL_SHARE_COPY_PATH = "/share/landbook_tsl.json"
 TSL_PATHS = (TSL_DATA_PATH, TSL_SHARE_COPY_PATH)
@@ -142,6 +160,12 @@ PUBLISH_SENSOR_SLUGS = {slug for key in PUBLISH_SENSOR_KEYS for slug in (re.sub(
 MAIN_TOPIC_PREFIX = "landbook"
 MAIN_DEVICE_NAME = "Landbook LAN Device"
 MAIN_DEVICE_OBJECT_ID = "landbook"
+# In standby this station really does report days of autonomy - 9800 minutes at
+# 73%, and the phone app shows the same 6 days 19 hours. The old 24-hour window
+# threw that away as noise and left the sensor stuck on an older value. The
+# product model declares the field up to 65535 minutes.
+REMAINING_TIME_MAX_MINUTES = 65535
+
 FREEZE_ALERT_AFTER = 90
 FREEZE_ALERT_COOLDOWN = 50
 COMPAT_SENSOR_ID_OVERRIDES = {
@@ -1644,7 +1668,7 @@ def apply_aliases(out: dict[str, Any]) -> None:
     remaining = out.get("remaining_time")
     if remaining is None:
         remaining = out.get("battery_data_remaining_time")
-    if not pack_only and _between(remaining, 0, 1440):
+    if not pack_only and _between(remaining, 0, REMAINING_TIME_MAX_MINUTES):
         out["remaining_time_minutes"] = int(float(remaining))
 
     cell_values: list[float] = []
@@ -1827,9 +1851,9 @@ def prune_decoded_for_cache(decoded: dict[str, Any]) -> dict[str, Any]:
     if pack_only:
         for key in ("soc", "battery_percentage", "remaining_time", "remaining_time_minutes"):
             cleaned.pop(key, None)
-    if "remaining_time_minutes" in cleaned and not _between(cleaned.get("remaining_time_minutes"), 0, 1440):
+    if "remaining_time_minutes" in cleaned and not _between(cleaned.get("remaining_time_minutes"), 0, REMAINING_TIME_MAX_MINUTES):
         cleaned.pop("remaining_time_minutes", None)
-    if "remaining_time" in cleaned and not _between(cleaned.get("remaining_time"), 0, 1440):
+    if "remaining_time" in cleaned and not _between(cleaned.get("remaining_time"), 0, REMAINING_TIME_MAX_MINUTES):
         cleaned.pop("remaining_time", None)
     return cleaned
 

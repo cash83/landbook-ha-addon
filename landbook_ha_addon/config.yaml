@@ -1,5 +1,5 @@
 name: Landbook LAN MQTT Bridge
-version: "0.13.0"
+version: "0.14.0"
 slug: landbook_lan_mqtt_bridge
 description: "Landbook/Wonderfree LAN bridge: powerstation LAN con smart socket Wonderfree in HA."
 url: "https://github.com/cash83/landbook-ha-addon"
@@ -40,8 +40,8 @@ options:
   smart_socket_2_product_key: ""
   smart_socket_2_name: ""
   read_interval: 10
-  rearm_interval: 20
-  hfr_mode: 1
+  rearm_interval: 12
+  hfr_mode: 3
   frame_timeout: 30
   freeze_detection_enabled: true
   freeze_alert_after: 90

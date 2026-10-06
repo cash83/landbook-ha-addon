@@ -38,7 +38,7 @@ class MqttOut:
         self.last_decoded_dump = ""
         self.last_wifi_frozen_alert = 0.0
         self.last_lan_online_at = 0.0
-        self.client = mqtt.Client(client_id=f"test_powerstation_{self.dk}_{random.randint(1000, 9999)}")
+        self.client = mqtt.Client(client_id=f"landbook_{self.dk}_{random.randint(1000, 9999)}")
         self.client.will_set(self.compat_availability_topic, "offline", qos=1, retain=True)
         self.client.on_message = self.on_message
         user = str(opt(opts, "mqtt_user", "") or "")
@@ -579,6 +579,20 @@ def run_lan_session(opts: dict[str, Any], mqtt_out: MqttOut, host: str, port: in
         for frame in frames:
             cmd = int(frame.get("cmd"))
             payload = frame.get("payload", b"")
+            if cmd == CMD_PING:
+                # The station pings us as well, and tears the session down when
+                # the pong does not come back.
+                sock.sendall(encode_cmd(CMD_PONG, pid))
+                pid += 1
+                log("replied p8 pong to station ping", "debug")
+                continue
+            if cmd == CMD_HEARTBEAT and not payload:
+                # A bare p9 from the station is its own heartbeat, not an answer
+                # to the encrypted one we send: it wants the frame echoed back.
+                sock.sendall(encode_cmd(CMD_HEARTBEAT, pid))
+                pid += 1
+                log("echoed p9 heartbeat back to station", "debug")
+                continue
             if cmd == CMD_PONG:
                 log("received p8 pong", "debug")
                 continue
@@ -632,6 +646,7 @@ def is_lan_unreachable_error(message: str) -> bool:
 
 
 def main() -> None:
+    migrate_legacy_state()
     opts = read_options()
     os.environ["LOG_LEVEL"] = str(opt(opts, "log_level", "info")).lower()
     timezone = str(opt(opts, "timezone", "Europe/Rome") or "Europe/Rome")

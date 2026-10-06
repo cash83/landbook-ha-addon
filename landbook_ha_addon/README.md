@@ -101,8 +101,8 @@ Comportamento:
 
 ## Cache
 
-- `/data/test_powerstation_lan_key.json`: LAN key associata ad account e piattaforma.
-- `/data/test_powerstation_lan_host.json`: ultimo indirizzo LAN visto.
+- `/data/landbook_lan_key.json`: LAN key associata ad account e piattaforma.
+- `/data/landbook_lan_host.json`: ultimo indirizzo LAN visto.
 - `/data/landbook_tsl.json`: TSL usato dal runtime.
 - `/share/landbook_tsl.json`: copia leggibile dello stesso TSL, per ispezione manuale.
 

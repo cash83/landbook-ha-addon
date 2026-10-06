@@ -24,7 +24,7 @@ class SmartSocketWorker:
         if not bool_opt(self.opts, "smart_sockets_enabled", True):
             log("smart sockets disabled")
             return None
-        client_id = f"test_powerstation_sockets_{self.parent_dk}_{random.randint(1000, 9999)}"
+        client_id = f"landbook_sockets_{self.parent_dk}_{random.randint(1000, 9999)}"
         client = mqtt.Client(client_id=client_id)
         user = str(opt(self.opts, "mqtt_user", "") or "")
         password = str(opt(self.opts, "mqtt_password", "") or "")

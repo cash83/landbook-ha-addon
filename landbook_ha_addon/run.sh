@@ -1,4 +1,4 @@
 #!/bin/sh
 set -eu
 echo "[Landbook LAN MQTT Bridge] booting..."
-exec python3 -u /app/test_powerstation.py
+exec python3 -u /app/landbook_bridge.py
