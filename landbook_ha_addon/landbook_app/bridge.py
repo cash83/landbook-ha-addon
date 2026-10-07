@@ -215,7 +215,11 @@ class MqttOut:
             payload["suggested_display_precision"] = precision
         if has_measurement_state_class(compat_id, sample):
             payload["state_class"] = "measurement"
+        category = entity_category_for(compat_id)
+        if category:
+            payload["entity_category"] = category
         topic = f"{self.discovery_prefix}/sensor/{self.dk}/{compat_id}/config"
+        self.client.publish(topic, b"", retain=True)
         self.client.publish(topic, json.dumps(payload), retain=True)
 
     def compat_control_object_id(self, code: str, kind: str) -> str:

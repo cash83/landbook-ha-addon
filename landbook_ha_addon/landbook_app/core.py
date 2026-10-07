@@ -97,7 +97,6 @@ RAW_DUPLICATE_KEYS = {
     "pv_data",
     "pv_total_power",
     "pv_1_power",
-    "pv_1_voltage",
     "grid_frequency",
     "ac_power",
     "dc_total_power",
@@ -127,6 +126,10 @@ PUBLISH_SENSOR_KEYS = {
     "battery_temp",
     "remaining_time_minutes",
     "pv_input_power",
+    # Arriva SOLO nella risposta alla richiesta esplicita (cmd 17), mai nei
+    # report spontanei: per questo non si era mai visto. La richiesta la
+    # facciamo gia' ogni rearm_interval, quindi il dato era gia' in casa.
+    "pv_1_voltage",
     "total_input_power",
     "ac_input_power",
     "ac_output_power",
@@ -154,6 +157,12 @@ PUBLISH_SENSOR_KEYS = {
     "temp_inv",
     "temp_mppt",
     "signal_strength_set",
+    # Salute del pacco: arrivano a ogni frame del BMS e finora venivano scartati.
+    # I cicli dicono quanto e' stata usata davvero la batteria, la corrente
+    # massima concessa dice se il BMS sta limitando la carica.
+    "battery_cycles",
+    "bms_allow_max_charge_current",
+    "bms_mos_status",
 }
 PUBLISH_SENSOR_KEYS.update({f"battery_cell_{i:02d}_voltage" for i in range(1, 14)})
 PUBLISH_SENSOR_SLUGS = {slug for key in PUBLISH_SENSOR_KEYS for slug in (re.sub(r"_+", "_", re.sub(r"[^a-zA-Z0-9_]+", "_", key.strip().lower())).strip("_"),)}
@@ -168,6 +177,23 @@ REMAINING_TIME_MAX_MINUTES = 65535
 
 FREEZE_ALERT_AFTER = 90
 FREEZE_ALERT_COOLDOWN = 50
+DIAGNOSTIC_SENSOR_SLUGS = {
+    "signal_strength_set",
+    "lan_connection",
+    "bms_mos_status",
+    "battery_cycles",
+    "bms_allow_max_charge_current",
+    "temp_bms",
+    "temp_inv",
+    "temp_mppt",
+}
+DIAGNOSTIC_SENSOR_SLUGS.update({f"battery_cell_{i:02d}_voltage" for i in range(1, 14)})
+
+
+def entity_category_for(key: str) -> str | None:
+    return "diagnostic" if slugify(key) in DIAGNOSTIC_SENSOR_SLUGS else None
+
+
 COMPAT_SENSOR_ID_OVERRIDES = {
     "dc_12v_power": "dc12v_power",
     "dc_12v_voltage": "dc12v_voltage",
@@ -183,6 +209,10 @@ COMPAT_SENSOR_ID_OVERRIDES = {
     "usb_4_voltage": "usb_a4_voltage",
 }
 COMPAT_SENSOR_NAME_OVERRIDES = {
+    "pv_1_voltage": "PV1 Voltage",
+    "battery_cycles": "Cicli batteria",
+    "bms_allow_max_charge_current": "Corrente massima di carica",
+    "bms_mos_status": "Stato MOS del BMS",
     "lan_connection": "LAN Connection",
     "battery_percentage": "Battery",
     "battery_remaining_wh": "Battery Remaining",
@@ -1465,8 +1495,14 @@ def spec_scale(info: dict[str, Any]) -> float:
     return 1.0
 
 
+NO_SCALE_CODES = {"pv_1_voltage"}
+
+
 def apply_scale(value: Any, info: dict[str, Any]) -> Any:
     if isinstance(value, (int, float)):
+        code = str(info.get("code") or "") if isinstance(info, dict) else ""
+        if code in NO_SCALE_CODES:
+            return value
         scale = spec_scale(info)
         if scale != 1.0:
             return round(float(value) * scale, 3)
@@ -1815,10 +1851,11 @@ def slugify(value: str) -> str:
     return value or "value"
 
 
+# Doppioni grezzi di valori gia' pubblicati sotto un altro nome: restano fuori.
+# I tre dati di salute del pacco (cicli, corrente massima concessa, stato MOS)
+# stavano qui pur non duplicando nulla, quindi venivano ricevuti e buttati via:
+# ora tornano pubblicati.
 LEGACY_SENSOR_CLEANUP_KEYS = {
-    "battery_cycles",
-    "bms_allow_max_charge_current",
-    "bms_mos_status",
     "dc_output_power",
     "grid_freq",
     "pv_panel_voltage",

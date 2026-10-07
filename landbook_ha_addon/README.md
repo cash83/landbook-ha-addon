@@ -28,9 +28,19 @@ continuano a usare il cloud Wonderfree tramite il loro worker indipendente.
 
 Entità pubblicate: batteria (percentuale, energia residua, tempo residuo,
 tensione, corrente, potenza, temperatura, 13 tensioni di cella), uscite AC/DC
-12V/24V/USB/Type-C, rete, PV, potenze totali di ingresso e uscita, temperature
-di BMS, inverter e MPPT, stato dispositivo, codice guasto e stato della
-connessione LAN.
+12V/24V/USB/Type-C, rete, PV (potenza e tensione dei pannelli), potenze totali
+di ingresso e uscita, temperature di BMS, inverter e MPPT, cicli della batteria,
+corrente massima di carica concessa dal BMS, stato dei MOS, stato dispositivo,
+codice guasto e stato della connessione LAN.
+
+Le letture tecniche finiscono nel cassetto **Diagnostica** invece che
+nell'elenco principale: stato della connessione, potenza del segnale, le 13
+tensioni di cella, cicli, corrente massima di carica, stato dei MOS e le tre
+temperature delle schede. L'elenco sta in `DIAGNOSTIC_SENSOR_SLUGS` dentro
+`core.py`. Attenzione: Home Assistant si tiene una `entity_category` già
+registrata anche quando un payload successivo la omette, quindi la config di
+discovery va ritirata (payload vuoto) prima di riscriverla — è quello che fa
+`compat_sensor_discovery`.
 
 Controlli: uscita AC, uscita DC, uscita on-grid, buzzer, LED, silent charge
 (6 switch); modalità di lavoro, SOC di scarica, spegnimento schermo, piano
@@ -146,9 +156,25 @@ Tre trappole costate parecchio tempo, tutte verificate sul campo:
   delle prese AC (gruppo `ac_data`), il secondo è il micro inverter verso casa
   (gruppo `grid_data`). Non devono sovrascriversi.
 
+- **La tensione dei pannelli esiste solo nella risposta alla richiesta.**
+  `pv_1_voltage` (id 3 del gruppo `pv_data`) non compare MAI nei report
+  spontanei: torna soltanto nella risposta al `CMD_READ` (cmd 17). Siccome la
+  lettura completa viene già chiesta a ogni giro, il dato c'era da sempre ed era
+  solo scartato come doppione. Il campo gemello `pv_1_power` invece replica
+  `pv_total_power`, e resta fuori.
+
 Inoltre il TSL dichiara `step: 0.1` per `ac_voltage` e `bms_mos_temp`, ma il
 dispositivo manda volt e gradi interi: senza correzione si leggono 23 V invece
 di 230 V e un decimo della temperatura reale.
+
+Lo `step` del TSL però **non è un fattore di conversione**: è la risoluzione del
+campo, e il TTLV porta già i decimali nel prefisso del numero. I valori che
+arrivano interi vanno quindi scalati, quelli che arrivano con la virgola no.
+`pv_1_voltage` arriva già in volt (40.3) e moltiplicarlo per lo step lo faceva
+diventare 4,03: per questo sta in `NO_SCALE_CODES`. Gli altri voltaggi
+sopravvivono allo stesso errore solo perché una `normalize_*` a valle li
+raddrizza (USB 0,5 → 5 V, DC24 2,4 → 24 V), quindi **non** si corregge
+`apply_scale` in generale senza togliere prima quelle compensazioni.
 
 ## Requisiti
 
