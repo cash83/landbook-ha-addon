@@ -668,7 +668,7 @@ def main() -> None:
     cached_host, cached_port = load_host_cache()
     configured_host = str(opt(opts, "device_host", "") or "").strip()
     scan_cidr = str(opt(opts, "udp_scan_cidr", "") or "").strip()
-    if cached_host and not configured_host and scan_cidr and not host_matches_any_cidr(cached_host, (scan_cidr,)):
+    if cached_host and not configured_host and scan_cidr and not host_matches_any_cidr(cached_host, (scan_cidr, cidr_from_host(local_ipv4_guess()))):
         log(f"ignoring cached LAN host {cached_host}; outside udp_scan_cidr={normalized_cidr(scan_cidr) or scan_cidr}", "warning")
         cached_host = ""
     last_host = configured_host or cached_host

@@ -1149,7 +1149,7 @@ def udp_discover(opts: dict[str, Any], expected_dk: str = "") -> tuple[str, int,
     targets.append("255.255.255.255")
     remaining_hosts = MAX_UDP_SCAN_HOSTS
     seen_cidrs: set[str] = set()
-    scan_cidrs = (scan_cidr,) if scan_cidr else (cidr_from_host(configured_host), cidr_from_host(local_ipv4_guess()))
+    scan_cidrs = (scan_cidr, cidr_from_host(configured_host), cidr_from_host(local_ipv4_guess()))
     for cidr in scan_cidrs:
         cidr = normalized_cidr(cidr)
         if not cidr or cidr in seen_cidrs:
