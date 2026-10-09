@@ -694,7 +694,18 @@ def main() -> None:
         controls = build_control_catalogs()
         log(f"TSL/read list loaded: ids={len(read_ids)} {read_ids}")
         log(f"TSL controls loaded: {sorted(controls)}")
+        # Il dispositivo padre ("Landbook LAN Device") nasce dalla discovery
+        # di MqttOut, pubblicata appena il client MQTT si connette (non serve
+        # la LAN). Va creato PRIMA del worker prese: altrimenti le prese, che
+        # arrivano dal cloud, escono prima del padre e HA fissa via_device solo
+        # alla creazione, lasciando le prese slegate (es. quando la stazione e'
+        # irraggiungibile per un cambio rete). Il breve respiro lascia a HA il
+        # tempo di registrare il padre prima delle prese.
+        if mqtt_out is None:
+            mqtt_out = MqttOut(opts, dk, pk)
+            mqtt_out.publish_control_discovery(controls)
         if bool_opt(opts, "smart_sockets_enabled", True):
+            time.sleep(2.0)
             socket_worker = SmartSocketWorker(opts, dk, pk).start()
         while True:
             try:
